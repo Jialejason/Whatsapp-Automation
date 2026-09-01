@@ -1,12 +1,11 @@
 const express = require('express');
-const qrcode = require('qrcode');
+const QRCode = require('qrcode');
 const axios = require('axios');
 const pino = require('pino');
 const {
   default: makeWASocket,
   useMultiFileAuthState,
-  DisconnectReason,
-  fetchLatestBaileysVersion
+  DisconnectReason
 } = require('@whiskeysockets/baileys');
 
 const app = express();
@@ -16,15 +15,13 @@ const PORT = process.env.PORT || 3000;
 const GAS_WEBHOOK_URL = process.env.GAS_WEBHOOK_URL || '';
 
 let sock = null;
-let currentQR = '';
+let qrBase64Image = '';
 let isConnected = false;
 
 async function startWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
-  const { version } = await fetchLatestBaileysVersion();
 
   sock = makeWASocket({
-    version,
     auth: state,
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
@@ -33,18 +30,22 @@ async function startWhatsApp() {
 
   sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('connection.update', (update) => {
+  sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      currentQR = qr;
-      isConnected = false;
-      console.log('>>> [QR] 二维码已刷新');
+      try {
+        qrBase64Image = await QRCode.toDataURL(qr, { width: 280, margin: 2 });
+        isConnected = false;
+        console.log('>>> [QR] 二维码 Base64 生成成功');
+      } catch (err) {
+        console.error('二维码转换失败:', err);
+      }
     }
 
     if (connection === 'close') {
       isConnected = false;
-      currentQR = '';
+      qrBase64Image = '';
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
       console.log(`连接断开 (Status: ${statusCode})，5秒后重试...`);
@@ -53,8 +54,8 @@ async function startWhatsApp() {
       }
     } else if (connection === 'open') {
       isConnected = true;
-      currentQR = '';
-      console.log('>>> [SUCCESS] WhatsApp 已成功连接！');
+      qrBase64Image = '';
+      console.log('>>> [SUCCESS] WhatsApp 已成功连接上线！');
     }
   });
 
@@ -98,12 +99,12 @@ async function startWhatsApp() {
   });
 }
 
-// 供前端动态获取 QR 字符串
-app.get('/qr-raw', (req, res) => {
-  res.json({ connected: isConnected, qr: currentQR });
+// 供前端轮询二维码图片数据
+app.get('/qr-data', (req, res) => {
+  res.json({ connected: isConnected, qrImage: qrBase64Image });
 });
 
-// 二维码前端页面
+// 二维码扫码页面
 app.get('/qr', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -111,49 +112,51 @@ app.get('/qr', (req, res) => {
     <head>
       <meta charset="utf-8">
       <title>WhatsApp 扫码授权</title>
-      <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
       <style>
-        body { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 90vh; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f7f9fa; }
-        .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); text-align: center; }
-        #canvas { margin: 15px 0; border: 1px solid #eee; padding: 10px; border-radius: 8px; }
-        .status { color: #666; font-size: 14px; }
+        body { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 90vh; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f7f9fa; margin: 0; }
+        .card { background: white; padding: 32px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); text-align: center; width: 320px; }
+        .qr-box { width: 280px; height: 280px; margin: 16px auto; display: flex; align-items: center; justify-content: center; border: 1px solid #eee; border-radius: 8px; background: #fafafa; }
+        .qr-box img { width: 100%; height: 100%; border-radius: 8px; display: block; }
+        .status { color: #666; font-size: 14px; margin-top: 12px; }
       </style>
     </head>
     <body>
       <div class="card">
-        <h2 id="title">WhatsApp 扫码登录</h2>
-        <div id="loading">⏳ 正在获取二维码，请稍候...</div>
-        <canvas id="canvas" style="display:none;"></canvas>
-        <p class="status" id="desc">请使用手机 WhatsApp 扫描屏幕上的二维码</p>
+        <h2 id="title" style="margin-top:0;">WhatsApp 扫码登录</h2>
+        <div class="qr-box">
+          <div id="loading">⏳ 获取中...</div>
+          <img id="qr-img" style="display:none;" />
+        </div>
+        <p class="status" id="desc">请使用手机 WhatsApp 扫码绑定</p>
       </div>
 
       <script>
-        let lastQR = '';
-        async function checkStatus() {
+        let currentImg = '';
+        async function pollQR() {
           try {
-            const res = await fetch('/qr-raw');
+            const res = await fetch('/qr-data');
             const data = await res.json();
             
             if (data.connected) {
               document.getElementById('title').innerText = '✅ 连接成功！';
               document.getElementById('title').style.color = '#2e7d32';
               document.getElementById('loading').style.display = 'none';
-              document.getElementById('canvas').style.display = 'none';
-              document.getElementById('desc').innerText = 'WhatsApp 网关已就绪，可关闭此页面。';
+              document.getElementById('qr-img').style.display = 'none';
+              document.getElementById('desc').innerText = 'WhatsApp 网关已在线，可以关闭本页面。';
               return;
             }
 
-            if (data.qr && data.qr !== lastQR) {
-              lastQR = data.qr;
+            if (data.qrImage && data.qrImage !== currentImg) {
+              currentImg = data.qrImage;
               document.getElementById('loading').style.display = 'none';
-              const canvas = document.getElementById('canvas');
-              canvas.style.display = 'block';
-              QRCode.toCanvas(canvas, data.qr, { width: 260, margin: 2 });
+              const img = document.getElementById('qr-img');
+              img.src = data.qrImage;
+              img.style.display = 'block';
             }
           } catch (e) {}
         }
-        setInterval(checkStatus, 2000);
-        checkStatus();
+        setInterval(pollQR, 1500);
+        pollQR();
       </script>
     </body>
     </html>
