@@ -6,7 +6,7 @@ const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
-  Browsers
+  fetchLatestBaileysVersion
 } = require('@whiskeysockets/baileys');
 
 const app = express();
@@ -16,42 +16,45 @@ const PORT = process.env.PORT || 3000;
 const GAS_WEBHOOK_URL = process.env.GAS_WEBHOOK_URL || '';
 
 let sock = null;
-let qrCodeData = '';
+let currentQR = '';
 let isConnected = false;
 
 async function startWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
+  const { version } = await fetchLatestBaileysVersion();
 
   sock = makeWASocket({
+    version,
     auth: state,
     logger: pino({ level: 'silent' }),
-    browser: Browsers.macOS('Desktop'),
-    syncFullHistory: false
+    printQRInTerminal: false,
+    browser: ['Ubuntu', 'Chrome', '20.0.04']
   });
 
   sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('connection.update', async (update) => {
+  sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      qrCodeData = qr;
+      currentQR = qr;
       isConnected = false;
-      console.log('✅ 新二维码已成功生成！');
+      console.log('>>> [QR] 二维码已刷新');
     }
 
     if (connection === 'close') {
       isConnected = false;
+      currentQR = '';
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      console.log(`连接断开 (Code: ${statusCode})，是否尝试重连:`, shouldReconnect);
+      console.log(`连接断开 (Status: ${statusCode})，5秒后重试...`);
       if (shouldReconnect) {
-        startWhatsApp();
+        setTimeout(startWhatsApp, 5000);
       }
     } else if (connection === 'open') {
       isConnected = true;
-      qrCodeData = '';
-      console.log('🎉 WhatsApp 已成功连接上线！');
+      currentQR = '';
+      console.log('>>> [SUCCESS] WhatsApp 已成功连接！');
     }
   });
 
@@ -88,60 +91,82 @@ async function startWhatsApp() {
             timestamp: msg.messageTimestamp || Math.floor(Date.now() / 1000)
           }, { timeout: 15000 });
         } catch (err) {
-          console.error('推送 Webhook 失败:', err.message);
+          console.error('Webhook 推送失败:', err.message);
         }
       }
     }
   });
 }
 
-// 二维码扫码页面（带自动刷新）
-app.get('/qr', async (req, res) => {
-  if (isConnected) {
-    return res.send(`
-      <div style="text-align:center;margin-top:50px;font-family:sans-serif;">
-        <h2 style="color:green;">✅ WhatsApp 已经处于连接状态，无需扫码！</h2>
-      </div>
-    `);
-  }
-
-  if (!qrCodeData) {
-    return res.send(`
-      <div style="text-align:center;margin-top:50px;font-family:sans-serif;">
-        <h2>⏳ 正在生成二维码，请稍候...</h2>
-        <p>页面每 3 秒会自动刷新</p>
-        <script>setTimeout(() => { location.reload(); }, 3000);</script>
-      </div>
-    `);
-  }
-
-  try {
-    const qrImage = await qrcode.toDataURL(qrCodeData);
-    res.send(`
-      <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:90vh;font-family:sans-serif;">
-        <h2>请使用手机 WhatsApp 扫码登录</h2>
-        <img src="${qrImage}" style="width:300px;height:300px;border:1px solid #ccc;padding:12px;border-radius:10px;box-shadow:0 4px 10px rgba(0,0,0,0.1);"/>
-        <p style="color:#666;margin-top:15px;">扫码成功后页面将自动更新</p>
-        <script>setTimeout(() => { location.reload(); }, 6000);</script>
-      </div>
-    `);
-  } catch (err) {
-    res.status(500).send('生成二维码异常: ' + err.message);
-  }
+// 供前端动态获取 QR 字符串
+app.get('/qr-raw', (req, res) => {
+  res.json({ connected: isConnected, qr: currentQR });
 });
 
-app.get('/status', (req, res) => {
-  res.json({ status: isConnected ? 'connected' : 'disconnected' });
+// 二维码前端页面
+app.get('/qr', (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>WhatsApp 扫码授权</title>
+      <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+      <style>
+        body { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 90vh; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f7f9fa; }
+        .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); text-align: center; }
+        #canvas { margin: 15px 0; border: 1px solid #eee; padding: 10px; border-radius: 8px; }
+        .status { color: #666; font-size: 14px; }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <h2 id="title">WhatsApp 扫码登录</h2>
+        <div id="loading">⏳ 正在获取二维码，请稍候...</div>
+        <canvas id="canvas" style="display:none;"></canvas>
+        <p class="status" id="desc">请使用手机 WhatsApp 扫描屏幕上的二维码</p>
+      </div>
+
+      <script>
+        let lastQR = '';
+        async function checkStatus() {
+          try {
+            const res = await fetch('/qr-raw');
+            const data = await res.json();
+            
+            if (data.connected) {
+              document.getElementById('title').innerText = '✅ 连接成功！';
+              document.getElementById('title').style.color = '#2e7d32';
+              document.getElementById('loading').style.display = 'none';
+              document.getElementById('canvas').style.display = 'none';
+              document.getElementById('desc').innerText = 'WhatsApp 网关已就绪，可关闭此页面。';
+              return;
+            }
+
+            if (data.qr && data.qr !== lastQR) {
+              lastQR = data.qr;
+              document.getElementById('loading').style.display = 'none';
+              const canvas = document.getElementById('canvas');
+              canvas.style.display = 'block';
+              QRCode.toCanvas(canvas, data.qr, { width: 260, margin: 2 });
+            }
+          } catch (e) {}
+        }
+        setInterval(checkStatus, 2000);
+        checkStatus();
+      </script>
+    </body>
+    </html>
+  `);
 });
 
 app.post('/send', async (req, res) => {
   const { to, text } = req.body;
-
   if (!isConnected || !sock) {
     return res.status(503).json({ success: false, error: 'WhatsApp 尚未连接' });
   }
   if (!to || !text) {
-    return res.status(400).json({ success: false, error: '缺少 to 或 text 参数' });
+    return res.status(400).json({ success: false, error: '缺少 to 或 text' });
   }
 
   try {
@@ -149,11 +174,9 @@ app.post('/send', async (req, res) => {
     if (!targetJid.includes('@')) {
       targetJid = `${targetJid}@s.whatsapp.net`;
     }
-
     const result = await sock.sendMessage(targetJid, { text: text });
     res.json({ success: true, messageId: result.key.id });
   } catch (err) {
-    console.error('发送失败:', err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
