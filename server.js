@@ -6,7 +6,7 @@ const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
-  fetchLatestBaileysVersion
+  Browsers
 } = require('@whiskeysockets/baileys');
 
 const app = express();
@@ -21,13 +21,12 @@ let isConnected = false;
 
 async function startWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
-  const { version } = await fetchLatestBaileysVersion();
 
   sock = makeWASocket({
-    version,
     auth: state,
     logger: pino({ level: 'silent' }),
-    printQRInTerminal: true
+    browser: Browsers.macOS('Desktop'),
+    syncFullHistory: false
   });
 
   sock.ev.on('creds.update', saveCreds);
@@ -38,21 +37,21 @@ async function startWhatsApp() {
     if (qr) {
       qrCodeData = qr;
       isConnected = false;
-      console.log('新二维码已生成，请访问 /qr 扫码');
+      console.log('✅ 新二维码已成功生成！');
     }
 
     if (connection === 'close') {
       isConnected = false;
-      const shouldReconnect =
-        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log('连接已关闭，是否重连:', shouldReconnect);
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      console.log(`连接断开 (Code: ${statusCode})，是否尝试重连:`, shouldReconnect);
       if (shouldReconnect) {
         startWhatsApp();
       }
     } else if (connection === 'open') {
       isConnected = true;
       qrCodeData = '';
-      console.log('✅ WhatsApp 已成功连接上线！');
+      console.log('🎉 WhatsApp 已成功连接上线！');
     }
   });
 
@@ -76,7 +75,7 @@ async function startWhatsApp() {
 
       if (!text || !text.trim()) continue;
 
-      console.log(`[收到消息] 来源: ${chatId} | 发送者: ${senderName} | 内容: ${text}`);
+      console.log(`[收到消息] ${chatId} | ${senderName}: ${text}`);
 
       if (GAS_WEBHOOK_URL) {
         try {
@@ -89,19 +88,31 @@ async function startWhatsApp() {
             timestamp: msg.messageTimestamp || Math.floor(Date.now() / 1000)
           }, { timeout: 15000 });
         } catch (err) {
-          console.error('推送给 Google Apps Script 失败:', err.message);
+          console.error('推送 Webhook 失败:', err.message);
         }
       }
     }
   });
 }
 
+// 二维码扫码页面（带自动刷新）
 app.get('/qr', async (req, res) => {
   if (isConnected) {
-    return res.send('<h2 style="color:green;text-align:center;margin-top:50px;">✅ WhatsApp 已经处于连接状态，无需重复扫码！</h2>');
+    return res.send(`
+      <div style="text-align:center;margin-top:50px;font-family:sans-serif;">
+        <h2 style="color:green;">✅ WhatsApp 已经处于连接状态，无需扫码！</h2>
+      </div>
+    `);
   }
+
   if (!qrCodeData) {
-    return res.send('<h2 style="text-align:center;margin-top:50px;">⏳ 正在生成二维码，请稍等几秒后刷新页面...</h2>');
+    return res.send(`
+      <div style="text-align:center;margin-top:50px;font-family:sans-serif;">
+        <h2>⏳ 正在生成二维码，请稍候...</h2>
+        <p>页面每 3 秒会自动刷新</p>
+        <script>setTimeout(() => { location.reload(); }, 3000);</script>
+      </div>
+    `);
   }
 
   try {
@@ -109,12 +120,13 @@ app.get('/qr', async (req, res) => {
     res.send(`
       <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:90vh;font-family:sans-serif;">
         <h2>请使用手机 WhatsApp 扫码登录</h2>
-        <img src="${qrImage}" style="width:300px;height:300px;border:1px solid #ccc;padding:10px;border-radius:8px;"/>
-        <p style="color:#666;margin-top:15px;">扫码成功后刷新本页即可查看连接状态</p>
+        <img src="${qrImage}" style="width:300px;height:300px;border:1px solid #ccc;padding:12px;border-radius:10px;box-shadow:0 4px 10px rgba(0,0,0,0.1);"/>
+        <p style="color:#666;margin-top:15px;">扫码成功后页面将自动更新</p>
+        <script>setTimeout(() => { location.reload(); }, 6000);</script>
       </div>
     `);
   } catch (err) {
-    res.status(500).send('生成二维码失败: ' + err.message);
+    res.status(500).send('生成二维码异常: ' + err.message);
   }
 });
 
@@ -141,7 +153,7 @@ app.post('/send', async (req, res) => {
     const result = await sock.sendMessage(targetJid, { text: text });
     res.json({ success: true, messageId: result.key.id });
   } catch (err) {
-    console.error('发送消息异常:', err.message);
+    console.error('发送失败:', err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
