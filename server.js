@@ -1,25 +1,22 @@
 const express = require('express');
-const { 
-  default: makeWASocket, 
-  useMultiFileAuthState, 
-  DisconnectReason, 
-  fetchLatestBaileysVersion, 
-  Browsers 
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const QRCode = require('qrcode');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
-const fs = require('fs');
-const path = require('path');
 
 const app = express();
-app.use(express.json());
-
 const PORT = process.env.PORT || 10000;
-const ADMIN_PHONE = process.env.ADMIN_PHONE || '601137169383';
+
+const ADMIN_NUMBER = '601137169383'; // Jia Le
+const TARGET_NAME = 'MinKoNaing';    // 最终接收目标
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-// 初始化 Gemini
+// 初始化 Gemini (最新 3.6-flash)
 let model = null;
 if (GEMINI_API_KEY) {
   const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
@@ -29,211 +26,298 @@ if (GEMINI_API_KEY) {
   });
 }
 
-// 目标接收方配置（群聊或个人）
-const GROUP_MAP = {
-  "MinKoNaing": "601133577714@s.whatsapp.net",
-  "测试号": `${ADMIN_PHONE}@s.whatsapp.net`
-};
-
+// 内存状态
+let currentQR = null;
 let sock = null;
-let latestQrString = null;
-let isConnected = false;
-const pendingApprovals = new Map();
+let pendingTasks = new Map(); // taskId -> { data, originalChatId }
+let taskCounter = 1;
 
-async function startWhatsApp() {
-  const authFolder = path.join(__dirname, 'auth_info');
-  const { state, saveCreds } = await useMultiFileAuthState(authFolder);
-  
+// 群组与对话上下文缓存（最近10分钟，最多保留6条历史记录）
+const chatHistoryMap = new Map(); // chatId -> [ { sender, text, timestamp } ]
+
+function appendChatHistory(chatId, sender, text) {
+  if (!text) return;
+  const now = Date.now();
+  let history = chatHistoryMap.get(chatId) || [];
+  // 剔除 10 分钟以前的过期记录
+  history = history.filter(item => now - item.timestamp < 10 * 60 * 1000);
+  history.push({ sender, text, timestamp: now });
+  if (history.length > 6) history.shift();
+  chatHistoryMap.set(chatId, history);
+}
+
+function getRecentContext(chatId) {
+  const history = chatHistoryMap.get(chatId) || [];
+  return history.map(h => `${h.sender}: ${h.text}`).join('\n');
+}
+
+// 辅助：解析 WhatsApp 复杂消息体与引用消息
+function extractMessageContent(msg) {
+  if (!msg.message) return { text: '', quotedText: '' };
+
+  const messageType = Object.keys(msg.message)[0];
+  let text = '';
+  let quotedText = '';
+
+  if (messageType === 'conversation') {
+    text = msg.message.conversation;
+  } else if (messageType === 'extendedTextMessage') {
+    text = msg.message.extendedTextMessage.text || '';
+    const ctx = msg.message.extendedTextMessage.contextInfo;
+    if (ctx && ctx.quotedMessage) {
+      const qType = Object.keys(ctx.quotedMessage)[0];
+      if (qType === 'conversation') {
+        quotedText = ctx.quotedMessage.conversation;
+      } else if (qType === 'extendedTextMessage') {
+        quotedText = ctx.quotedMessage.extendedTextMessage.text || '';
+      }
+    }
+  } else if (messageType === 'imageMessage') {
+    text = msg.message.imageMessage.caption || '';
+  }
+
+  return { text: text.trim(), quotedText: quotedText.trim() };
+}
+
+// 启动 WhatsApp 连接
+async function startBot() {
+  const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
   const { version, isLatest } = await fetchLatestBaileysVersion();
   console.log(`>>> WhatsApp 协议版本: v${version.join('.')}, 是否最新: ${isLatest}`);
 
   sock = makeWASocket({
     version,
-    auth: state,
     logger: pino({ level: 'silent' }),
+    auth: state,
     printQRInTerminal: false,
-    browser: Browsers.ubuntu('Chrome'),
-    connectTimeoutMs: 60000,
-    defaultQueryTimeoutMs: 0,
-    keepAliveIntervalMs: 10000
+    generateHighQualityLinkPreview: true
   });
 
   sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('connection.update', (update) => {
+  sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      latestQrString = qr;
-      isConnected = false;
-      console.log('>>> [QR] 请访问 /qr 扫码');
+      try {
+        currentQR = await QRCode.toDataURL(qr);
+        console.log('>>> [QR] 请访问 /qr 扫码');
+      } catch (err) {
+        console.error('二维码生成错误:', err);
+      }
     }
 
     if (connection === 'close') {
-      isConnected = false;
+      const shouldReconnect =
+        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
       const statusCode = lastDisconnect?.error?.output?.statusCode;
-      console.log(`>>> 连接断开，状态码: ${statusCode || '未知'}`);
+      console.log(`>>> 连接断开, 状态码: ${statusCode}`);
 
-      // 515 = 注册成功后的必要重启，立即重新连接即可载入凭据
-      if (statusCode === 515 || statusCode === DisconnectReason.restartRequired) {
-        console.log('>>> 凭据保存成功，立即重启连接载入登录态...');
-        setTimeout(startWhatsApp, 1000);
-        return;
-      }
-
-      // 彻底登出或失效时才清理凭据
-      if (statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 403) {
-        console.log('>>> 凭据已失效，清空旧缓存...');
-        try {
-          fs.rmSync(authFolder, { recursive: true, force: true });
-        } catch (e) {}
-        setTimeout(startWhatsApp, 3000);
+      if (statusCode === 515) {
+        console.log('>>> 凭据保存成功, 立即重启连接载入登录态...');
+        setTimeout(startBot, 1000);
+      } else if (shouldReconnect) {
+        console.log('>>> 正在尝试重新连接...');
+        setTimeout(startBot, 3000);
       } else {
-        setTimeout(startWhatsApp, 3000);
+        console.log('>>> 设备已登出, 请清理凭据后重新扫码。');
       }
     } else if (connection === 'open') {
-      isConnected = true;
-      latestQrString = null;
+      currentQR = null;
       console.log('🎉🎉 WhatsApp AI Agent 已就绪！');
     }
   });
 
-  sock.ev.on('messages.upsert', async (m) => {
-    const msg = m.messages[0];
-    if (!msg.message || msg.key.fromMe) return;
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+    for (const msg of messages) {
+      await handleIncomingMessage(msg);
+    }
+  });
+}
 
-    const senderJid = msg.key.remoteJid;
-    const text = msg.message.conversation || 
-                 msg.message.extendedTextMessage?.text || '';
+// 核心业务处理
+async function handleIncomingMessage(msg) {
+  const chatId = msg.key.remoteJid;
+  if (!chatId || chatId === 'status@broadcast') return;
 
-    if (!text.trim()) return;
+  const isFromMe = msg.key.fromMe;
+  const pushName = msg.pushName || '未知用户';
+  const { text, quotedText } = extractMessageContent(msg);
 
-    const adminJid = `${ADMIN_PHONE}@s.whatsapp.net`;
+  if (!text) return;
 
-    // 审批指令响应
-    if (senderJid === adminJid) {
-      const trimmed = text.trim().toLowerCase();
-      if (pendingApprovals.has(trimmed)) {
-        const item = pendingApprovals.get(trimmed);
-        try {
-          await sock.sendMessage(item.targetChatId, { text: item.draftMessage });
-          await sock.sendMessage(adminJid, { text: `✅ 已成功转发至【${item.targetGroupName}】！` });
-          pendingApprovals.delete(trimmed);
-        } catch (err) {
-          await sock.sendMessage(adminJid, { text: `❌ 转发失败: ${err.message}` });
-        }
-        return;
-      } else if (trimmed.startsWith('0') || trimmed === 'cancel' || trimmed === '取消') {
-        const taskNum = trimmed.replace(/[^0-9]/g, '');
-        if (pendingApprovals.has(taskNum)) {
-          pendingApprovals.delete(taskNum);
-          await sock.sendMessage(adminJid, { text: `🗑️ 任务 #${taskNum} 已取消。` });
-        } else {
-          pendingApprovals.clear();
-          await sock.sendMessage(adminJid, { text: `🗑️ 已清空待审批队列。` });
-        }
-        return;
-      }
+  // 1. 处理管理员审批回复指令 (例如 "1", "9" 或 "0")
+  const adminJid = `${ADMIN_NUMBER}@s.whatsapp.net`;
+  const isFromAdmin = chatId === adminJid || (isFromMe && chatId.includes(ADMIN_NUMBER));
+
+  if (isFromAdmin && /^\d+$/.test(text)) {
+    const actionId = parseInt(text, 10);
+
+    if (actionId === 0) {
+      await sock.sendMessage(chatId, { text: '❌ 已取消全部待办任务。' });
+      pendingTasks.clear();
+      return;
     }
 
-    console.log(`[消息进站] 来源: ${senderJid} 内容: ${text.slice(0, 30)}...`);
-    handleIncomingMessage(senderJid, text, msg.pushName || '未知发送者');
-  });
-}
+    const task = pendingTasks.get(actionId);
+    if (task) {
+      // 匹配 MinKoNaing
+      const targetJid = await resolveContactOrGroupJid(TARGET_NAME);
+      if (targetJid) {
+        await sock.sendMessage(targetJid, { text: task.finalText });
+        await sock.sendMessage(chatId, {
+          text: `✅ [已发送] 任务 #${actionId} 已成功转发至 ${TARGET_NAME}！`
+        });
+      } else {
+        await sock.sendMessage(chatId, {
+          text: `⚠️ 无法找到目标联系人/群聊【${TARGET_NAME}】，请确认通讯录已有聊天记录。已暂存。`
+        });
+      }
+      pendingTasks.delete(actionId);
+      return;
+    }
+  }
 
-async function handleIncomingMessage(sourceJid, text, senderName) {
+  // 2. 忽略自己发出的日常业务消息
+  if (isFromMe) return;
+
+  // 3. 记录群聊/私聊上下文
+  appendChatHistory(chatId, pushName, text);
+
+  // 4. 调用 AI 进行多轮对话与引用分析
   if (!model) return;
 
-  const groupKeys = Object.keys(GROUP_MAP).join('、');
-  const prompt = `你是一名专业紧固件/工业品物流出货助理。请分析以下进站消息：
-发件人: ${senderName}
-原始文本:
-"""
-${text}
-"""
-
-任务：
-1. 判断是否包含出货通知、提货、DO单号、托盘数等业务信息。若是闲聊客套，isMeaningful 设为 false。
-2. 提取核心事实，排版为工整专业、准备发给下游群的正式通知文案（保留DO号、托盘数、地点、联系人等，格式美观）。
-3. 候选目标群聊名称：${groupKeys}。选择最适合的目标群（默认选 'MinKoNaing'）。
-
-严格按 JSON 输出：
-{
-  "isMeaningful": true,
-  "draftMessage": "排版工整的最终通知文案",
-  "suggestedGroupName": "Profast业务群"
-}`;
-
   try {
-    const result = await model.generateContent(prompt);
-    const response = await result.response;
-    const resJson = JSON.parse(response.text());
+    const recentContext = getRecentContext(chatId);
+    const analysisPrompt = `
+你是一个专业的马来西亚物流出货智能助理。
+以下是当前收到的最新消息以及关联上下文，请综合分析：
 
-    if (!resJson.isMeaningful) return;
+【发件人】: ${pushName}
+【当前最新消息】: "${text}"
+${quotedText ? `【引用的上一条消息】: "${quotedText}"` : ''}
+【最近群聊/对话记录】:
+${recentContext}
 
-    const taskNum = String((pendingApprovals.size % 9) + 1);
-    const targetGroupName = resJson.suggestedGroupName || 'MinKoNaing';
-    const targetChatId = GROUP_MAP[targetGroupName] || GROUP_MAP['MinKoNaing'];
+业务研判规则：
+1. 判断这些对话中是否包含出货/提货/送货/DO单相关要素。
+2. 识别提取出：
+   - date: 日期
+   - time: 时间/提货地点备注 (如 2.30pm JAWI PROFAST)
+   - doNumber: DO单号 (如 DO-2609/003 & DO-2609/004)
+   - lorryPlate: 车牌号/运输车号 (重要：马来西亚常见车牌如 ANA9306、PKK1234 等若出现在回复中，属于车牌号，不是 DO 单号)
+   - pallets: 货物件数/托盘规格 (如 10 NORMAL PALLET)
+   - area: 送货/提货区域 (如 BATU CAVES)
+   - customer: 客户名称 (如 ADVANCE BOLTS & FASTENERS SDN BHD)
+   - phone: 联络电话
+3. 如果当前消息只是补充信息（例如引用了之前的单子补充了车牌号 "ANA9306"），必须将完整单据信息与该车牌号合并整合成一份最完整的出货通知！
+4. 如果完全只是闲聊打招呼，返回 isDelivery: false。
 
-    pendingApprovals.set(taskNum, {
-      draftMessage: resJson.draftMessage,
-      targetGroupName: targetGroupName,
-      targetChatId: targetChatId
-    });
+请仅严格以 JSON 格式输出：
+{
+  "isDelivery": true/false,
+  "date": "...",
+  "time": "...",
+  "doNumber": "...",
+  "lorryPlate": "...",
+  "pallets": "...",
+  "area": "...",
+  "customer": "...",
+  "phone": "..."
+}
+`;
 
-    const adminJid = `${ADMIN_PHONE}@s.whatsapp.net`;
-    const approvalPrompt = `📋 *【待审批出货通知 #${taskNum}】*
-*来源*: ${senderName}
-*目标群*: ${targetGroupName}
+    const result = await model.generateContent(analysisPrompt);
+    const jsonText = result.response.text().trim();
+    const data = JSON.parse(jsonText);
 
-*预定发送文案*:
---------------------------------
-${resJson.draftMessage}
---------------------------------
-👉 *回复【${taskNum}】确认立即转发*
-👉 *回复【0】或【取消】丢弃*`;
+    if (data.isDelivery && (data.doNumber || data.lorryPlate || data.customer)) {
+      const taskId = taskCounter++;
 
-    await sock.sendMessage(adminJid, { text: approvalPrompt });
-    console.log(`[已推送审批] 任务编号: #${taskNum}`);
+      // 格式化输出最终文案
+      let output = `【出货/提货通知 / Delivery Notice】\n`;
+      if (data.date) output += `📅 日期: ${data.date}\n`;
+      if (data.time) output += `⏰ 时间/地点: ${data.time}\n`;
+      if (data.doNumber) output += `📄 DO 单号: ${data.doNumber}\n`;
+      if (data.lorryPlate) output += `🚛 车牌号 (Lorry Plate): ${data.lorryPlate}\n`;
+      if (data.pallets) output += `📦 货物规格: ${data.pallets}\n`;
+      if (data.area) output += `📍 送货区域: ${data.area}\n`;
+      if (data.customer) output += `🏢 客户名称: ${data.customer}\n`;
+      if (data.phone) output += `📞 联络电话: ${data.phone}\n`;
+      output += `\n请相关人员跟进安排，谢谢！`;
 
+      pendingTasks.set(taskId, {
+        finalText: output,
+        originalChatId: chatId
+      });
+
+      // 推送审批卡片至管理员
+      const approvalCard = `📋【待审批出货通知 #${taskId}】
+来源: ${pushName}
+目标: ${TARGET_NAME}
+
+预定发送文案:
+------------------------------------
+${output}
+------------------------------------
+👉 回复【${taskId}】确认立即转发
+👉 回复【0】丢弃全部待办`;
+
+      await sock.sendMessage(adminJid, { text: approvalCard });
+      console.log(`[已推送审批] 任务编号: #${taskId} (包含车牌: ${data.lorryPlate || '无'})`);
+    }
   } catch (err) {
-    console.error('AI 解析异常:', err);
+    console.error('AI 解析与业务处理异常:', err);
   }
 }
 
-app.get('/status', (req, res) => {
-  res.json({ 
-    connected: isConnected, 
-    pendingTasks: pendingApprovals.size,
-    aiReady: !!model 
-  });
-});
-
-app.get('/reset', (req, res) => {
+// 目标联系人/群聊解析
+async function resolveContactOrGroupJid(name) {
   try {
-    fs.rmSync(path.join(__dirname, 'auth_info'), { recursive: true, force: true });
-    latestQrString = null;
-    isConnected = false;
-    startWhatsApp();
-    res.send('<h3>凭证已清空，正在重置... 稍后访问 /qr</h3>');
+    const chats = await sock.groupFetchAllParticipating();
+    for (const jid in chats) {
+      if (chats[jid].subject && chats[jid].subject.includes(name)) {
+        return jid;
+      }
+    }
   } catch (e) {
-    res.send('重置失败: ' + e.message);
+    // 忽略群解析错误，继续匹配个人
+  }
+  // 也可以在环境变量中预设特定联系人的 JID
+  return process.env.TARGET_JID || null;
+}
+
+// 路由服务
+app.get('/qr', (req, res) => {
+  if (currentQR) {
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+        <head><title>WhatsApp 扫码登录</title><meta http-equiv="refresh" content="5"></head>
+        <body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:90vh;font-family:sans-serif;">
+          <h2>请使用 WhatsApp 扫描二维码</h2>
+          <img src="${currentQR}" style="width:300px;height:300px;" />
+          <p style="color:gray;">每 5 秒自动刷新状态</p>
+        </body>
+      </html>
+    `);
+  } else {
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+        <head><title>WhatsApp 状态</title><meta http-equiv="refresh" content="5"></head>
+        <body style="display:flex;align-items:center;justify-content:center;height:90vh;font-family:sans-serif;">
+          <h2 style="color:green;">🎉 WhatsApp 已成功连接！无需扫码。</h2>
+        </body>
+      </html>
+    `);
   }
 });
 
-app.get('/qr', async (req, res) => {
-  if (isConnected) return res.send('<h2 style="color:green;text-align:center;">✅ 已经成功连接！</h2>');
-  if (!latestQrString) return res.send('<h2 style="text-align:center;">二维码生成中，请在 3-5 秒后刷新本页面...</h2>');
-  const qrImage = await QRCode.toDataURL(latestQrString);
-  res.send(`
-    <div style="display:flex;flex-direction:column;align-items:center;margin-top:50px;">
-      <h2>请用 WhatsApp 扫码连接 AI Agent</h2>
-      <img src="${qrImage}" style="width:300px;height:300px;border:1px solid #ccc;" />
-    </div>
-  `);
-});
+app.get('/', (req, res) => res.send('WhatsApp AI Automation is Live.'));
 
 app.listen(PORT, () => {
   console.log(`Gateway 监听端口: ${PORT}`);
-  startWhatsApp();
+  startBot();
 });
