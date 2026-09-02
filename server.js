@@ -1,8 +1,10 @@
 const express = require('express');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const QRCode = require('qrcode');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.use(express.json());
@@ -11,7 +13,7 @@ const PORT = process.env.PORT || 10000;
 const ADMIN_PHONE = process.env.ADMIN_PHONE || '601137169383';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-// 初始化 Gemini 客户端
+// 初始化 Gemini
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({
   model: 'gemini-1.5-flash',
@@ -27,34 +29,47 @@ const GROUP_MAP = {
 let sock = null;
 let latestQrString = null;
 let isConnected = false;
-
-// 待审批队列存储 (存于内存)
 const pendingApprovals = new Map();
 
-// 启动 WhatsApp 连接
 async function startWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info');
+  const authFolder = path.join(__dirname, 'auth_info');
+  const { state, saveCreds } = await useMultiFileAuthState(authFolder);
 
   sock = makeWASocket({
     auth: state,
     logger: pino({ level: 'silent' }),
-    printQRInTerminal: false
+    printQRInTerminal: false,
+    browser: Browsers.macOS('Desktop')
   });
 
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
+    
     if (qr) {
       latestQrString = qr;
       isConnected = false;
-      console.log('>>> [QR] 已更新，请扫码');
+      console.log('>>> [QR] 已生成全新二维码，请访问 /qr 扫码');
     }
+
     if (connection === 'close') {
       isConnected = false;
-      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log('>>> 连接断开，5秒后重连...');
-      if (shouldReconnect) setTimeout(startWhatsApp, 5000);
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+
+      console.log(`>>> 连接断开，状态码: ${statusCode || '未知'}`);
+
+      // 如果是凭证失效/登出，清空损坏的凭证文件夹重新出码
+      if (isLoggedOut || statusCode === 401 || statusCode === 403) {
+        console.log('>>> 凭证已失效，清空旧数据以重新生成二维码...');
+        try {
+          fs.rmSync(authFolder, { recursive: true, force: true });
+        } catch (e) {}
+        setTimeout(startWhatsApp, 3000);
+      } else {
+        setTimeout(startWhatsApp, 5000);
+      }
     } else if (connection === 'open') {
       isConnected = true;
       latestQrString = null;
@@ -74,7 +89,7 @@ async function startWhatsApp() {
 
     const adminJid = `${ADMIN_PHONE}@s.whatsapp.net`;
 
-    // 1. 如果是来自管理员的私聊指令 (审批逻辑)
+    // 管理员私聊指令判断
     if (senderJid === adminJid) {
       const trimmed = text.trim().toLowerCase();
       if (pendingApprovals.has(trimmed)) {
@@ -100,13 +115,12 @@ async function startWhatsApp() {
       }
     }
 
-    // 2. 收到进站消息 -> AI 提炼与审批卡片生成
+    // 监听进站出货消息
     console.log(`[消息进站] 来源: ${senderJid} 内容: ${text.slice(0, 30)}...`);
     handleIncomingMessage(senderJid, text, msg.pushName || '未知发送者');
   });
 }
 
-// AI 提炼与生成审批请求
 async function handleIncomingMessage(sourceJid, text, senderName) {
   if (!GEMINI_API_KEY) {
     console.error('未配置 GEMINI_API_KEY');
@@ -140,7 +154,6 @@ ${text}
     
     if (!resJson.isMeaningful) return;
 
-    // 分配编号 (1~9)
     const taskNum = String((pendingApprovals.size % 9) + 1);
     const targetGroupName = resJson.suggestedGroupName || 'Profast业务群';
     const targetChatId = GROUP_MAP[targetGroupName] || GROUP_MAP['Profast业务群'];
@@ -151,7 +164,6 @@ ${text}
       targetChatId: targetChatId
     });
 
-    // 推送审批卡片到你的私聊 WhatsApp
     const adminJid = `${ADMIN_PHONE}@s.whatsapp.net`;
     const approvalPrompt = `📋 *【待审批出货通知 #${taskNum}】*
 *来源*: ${senderName}
@@ -172,14 +184,26 @@ ${resJson.draftMessage}
   }
 }
 
-// 网页状态与二维码接口
 app.get('/status', (req, res) => {
   res.json({ connected: isConnected, pendingTasks: pendingApprovals.size });
 });
 
+// 提供手动强制重置二维码接口
+app.get('/reset', (req, res) => {
+  try {
+    fs.rmSync(path.join(__dirname, 'auth_info'), { recursive: true, force: true });
+    latestQrString = null;
+    isConnected = false;
+    startWhatsApp();
+    res.send('<h3>旧凭证已清空，正在生成新二维码... 请稍后访问 /qr</h3>');
+  } catch (e) {
+    res.send('重置失败: ' + e.message);
+  }
+});
+
 app.get('/qr', async (req, res) => {
   if (isConnected) return res.send('<h2 style="color:green;text-align:center;">✅ 已经成功连接！</h2>');
-  if (!latestQrString) return res.send('<h2 style="text-align:center;">二维码生成中，请刷新...</h2>');
+  if (!latestQrString) return res.send('<h2 style="text-align:center;">二维码生成中，请在 5 秒后刷新页面...</h2>');
   const qrImage = await QRCode.toDataURL(latestQrString);
   res.send(`
     <div style="display:flex;flex-direction:column;align-items:center;margin-top:50px;">
