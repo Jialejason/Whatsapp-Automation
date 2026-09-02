@@ -24,9 +24,9 @@ let model = null;
 if (GEMINI_API_KEY) {
   const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
   model = genAI.getGenerativeModel({
-  model: 'gemini-1.5-flash-latest',
-  generationConfig: { responseMimeType: 'application/json' }
-});
+    model: 'gemini-1.5-flash',
+    generationConfig: { responseMimeType: 'application/json' }
+  }, { apiVersion: 'v1' }); // 明确指定 v1 正式版接口
 }
 
 // 目标接收方配置（群聊或个人）
