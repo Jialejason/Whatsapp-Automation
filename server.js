@@ -19,7 +19,7 @@ const PORT = process.env.PORT || 10000;
 const ADMIN_PHONE = process.env.ADMIN_PHONE || '601137169383';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-// 初始化 Gemini 客户端
+// 初始化 Gemini
 let model = null;
 if (GEMINI_API_KEY) {
   const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
@@ -29,7 +29,7 @@ if (GEMINI_API_KEY) {
   });
 }
 
-// 群聊映射表
+// 目标群配置
 const GROUP_MAP = {
   "Profast业务群": "120363228706613997@g.us",
   "测试号": `${ADMIN_PHONE}@s.whatsapp.net`
@@ -44,9 +44,8 @@ async function startWhatsApp() {
   const authFolder = path.join(__dirname, 'auth_info');
   const { state, saveCreds } = await useMultiFileAuthState(authFolder);
   
-  // 动态同步官方最新协议，彻底避免 405
   const { version, isLatest } = await fetchLatestBaileysVersion();
-  console.log(`>>> 使用 WhatsApp Web 协议版本: v${version.join('.')}, 最新: ${isLatest}`);
+  console.log(`>>> WhatsApp 协议版本: v${version.join('.')}, 是否最新: ${isLatest}`);
 
   sock = makeWASocket({
     version,
@@ -67,23 +66,30 @@ async function startWhatsApp() {
     if (qr) {
       latestQrString = qr;
       isConnected = false;
-      console.log('>>> [QR] 已生成全新二维码，请访问 /qr 扫码');
+      console.log('>>> [QR] 请访问 /qr 扫码');
     }
 
     if (connection === 'close') {
       isConnected = false;
       const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const isLoggedOut = statusCode === DisconnectReason.loggedOut;
       console.log(`>>> 连接断开，状态码: ${statusCode || '未知'}`);
 
-      if (isLoggedOut || statusCode === 401 || statusCode === 403 || statusCode === 405) {
-        console.log('>>> 凭证无效或状态冲突，清空缓存重新初始化...');
+      // 515 = 注册成功后的必要重启，立即重新连接即可载入凭据
+      if (statusCode === 515 || statusCode === DisconnectReason.restartRequired) {
+        console.log('>>> 凭据保存成功，立即重启连接载入登录态...');
+        setTimeout(startWhatsApp, 1000);
+        return;
+      }
+
+      // 彻底登出或失效时才清理凭据
+      if (statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 403) {
+        console.log('>>> 凭据已失效，清空旧缓存...');
         try {
           fs.rmSync(authFolder, { recursive: true, force: true });
         } catch (e) {}
         setTimeout(startWhatsApp, 3000);
       } else {
-        setTimeout(startWhatsApp, 5000);
+        setTimeout(startWhatsApp, 3000);
       }
     } else if (connection === 'open') {
       isConnected = true;
@@ -104,7 +110,7 @@ async function startWhatsApp() {
 
     const adminJid = `${ADMIN_PHONE}@s.whatsapp.net`;
 
-    // 1. 管理员指令审批流
+    // 审批指令响应
     if (senderJid === adminJid) {
       const trimmed = text.trim().toLowerCase();
       if (pendingApprovals.has(trimmed)) {
@@ -130,17 +136,13 @@ async function startWhatsApp() {
       }
     }
 
-    // 2. 业务消息进站 -> Gemini 处理
     console.log(`[消息进站] 来源: ${senderJid} 内容: ${text.slice(0, 30)}...`);
     handleIncomingMessage(senderJid, text, msg.pushName || '未知发送者');
   });
 }
 
 async function handleIncomingMessage(sourceJid, text, senderName) {
-  if (!model) {
-    console.error('Gemini 模型未就绪，请检查 GEMINI_API_KEY 环境变量');
-    return;
-  }
+  if (!model) return;
 
   const groupKeys = Object.keys(GROUP_MAP).join('、');
   const prompt = `你是一名专业紧固件/工业品物流出货助理。请分析以下进站消息：
@@ -213,7 +215,7 @@ app.get('/reset', (req, res) => {
     latestQrString = null;
     isConnected = false;
     startWhatsApp();
-    res.send('<h3>会话凭证已重置，正在重新建立连接... 请在 5 秒后访问 /qr</h3>');
+    res.send('<h3>凭证已清空，正在重置... 稍后访问 /qr</h3>');
   } catch (e) {
     res.send('重置失败: ' + e.message);
   }
