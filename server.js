@@ -23,9 +23,8 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 let model = null;
 if (GEMINI_API_KEY) {
   const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-  // 使用最兼容的 2.0-flash 或 1.5-flash-latest，并保持在 v1beta/默认模式
   model = genAI.getGenerativeModel({
-    model: 'gemini-2.0-flash',
+    model: 'gemini-2.5-flash',
     generationConfig: { responseMimeType: 'application/json' }
   });
 }
