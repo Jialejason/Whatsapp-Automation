@@ -16,7 +16,7 @@ const ADMIN_NUMBER = '601137169383'; // Jia Le
 const TARGET_NAME = 'MinKoNaing';    // 最终接收目标
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-// 初始化 Gemini (最新 3.6-flash)
+// 初始化 Gemini (使用当前支持的 3.6-flash)
 let model = null;
 if (GEMINI_API_KEY) {
   const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
@@ -29,17 +29,16 @@ if (GEMINI_API_KEY) {
 // 内存状态
 let currentQR = null;
 let sock = null;
-let pendingTasks = new Map(); // taskId -> { data, originalChatId }
+let pendingTasks = new Map(); // taskId -> { finalText, originalChatId }
 let taskCounter = 1;
 
-// 群组与对话上下文缓存（最近10分钟，最多保留6条历史记录）
+// 群组与对话上下文缓存（最近10分钟滑动窗口，保留最近6条）
 const chatHistoryMap = new Map(); // chatId -> [ { sender, text, timestamp } ]
 
 function appendChatHistory(chatId, sender, text) {
   if (!text) return;
   const now = Date.now();
   let history = chatHistoryMap.get(chatId) || [];
-  // 剔除 10 分钟以前的过期记录
   history = history.filter(item => now - item.timestamp < 10 * 60 * 1000);
   history.push({ sender, text, timestamp: now });
   if (history.length > 6) history.shift();
@@ -51,35 +50,68 @@ function getRecentContext(chatId) {
   return history.map(h => `${h.sender}: ${h.text}`).join('\n');
 }
 
-// 辅助：解析 WhatsApp 复杂消息体与引用消息
+// 辅助：全面解析 WhatsApp 消息及引用（Quote）内容
 function extractMessageContent(msg) {
   if (!msg.message) return { text: '', quotedText: '' };
 
-  const messageType = Object.keys(msg.message)[0];
   let text = '';
   let quotedText = '';
 
-  if (messageType === 'conversation') {
-    text = msg.message.conversation;
-  } else if (messageType === 'extendedTextMessage') {
-    text = msg.message.extendedTextMessage.text || '';
-    const ctx = msg.message.extendedTextMessage.contextInfo;
+  const m = msg.message;
+  if (m.conversation) {
+    text = m.conversation;
+  } else if (m.extendedTextMessage) {
+    text = m.extendedTextMessage.text || '';
+    const ctx = m.extendedTextMessage.contextInfo;
     if (ctx && ctx.quotedMessage) {
-      const qType = Object.keys(ctx.quotedMessage)[0];
-      if (qType === 'conversation') {
-        quotedText = ctx.quotedMessage.conversation;
-      } else if (qType === 'extendedTextMessage') {
-        quotedText = ctx.quotedMessage.extendedTextMessage.text || '';
-      }
+      const qm = ctx.quotedMessage;
+      quotedText = qm.conversation || (qm.extendedTextMessage && qm.extendedTextMessage.text) || '';
     }
-  } else if (messageType === 'imageMessage') {
-    text = msg.message.imageMessage.caption || '';
+  } else if (m.imageMessage) {
+    text = m.imageMessage.caption || '';
   }
 
   return { text: text.trim(), quotedText: quotedText.trim() };
 }
 
-// 启动 WhatsApp 连接
+// 前置关键词与马来西亚车牌正则过滤（避免非出货消息浪费免费配额）
+function isLogisticsRelevant(text, quotedText) {
+  const combined = `${text} ${quotedText}`.toLowerCase();
+  
+  // 物流高频业务词
+  const logisticsKeywords = [
+    'do', 'pallet', 'lorry', 'plate', 'batu', 'jawi', 'profast',
+    '客户', '日期', '车牌', '提货', '送货', '出货', '单号', '箱', 'pcs'
+  ];
+  const hitKeyword = logisticsKeywords.some(kw => combined.includes(kw));
+
+  // 马来西亚车牌正则（如 ANA9306, PKK 1234, W 1234 A, VAA 888）
+  const plateRegex = /\b[A-Za-z]{1,3}\s*\d{1,4}\s*[A-Za-z]?\b/;
+  const hitPlate = plateRegex.test(combined);
+
+  return hitKeyword || hitPlate;
+}
+
+// 带自动退避的 Gemini 调用（防 429 崩溃）
+async function callGeminiWithRetry(prompt, retries = 2, delayMs = 3000) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const result = await model.generateContent(prompt);
+      return result.response.text().trim();
+    } catch (err) {
+      const errStr = String(err);
+      if (errStr.includes('429') && attempt < retries) {
+        console.warn(`[限频警告] 遇到 429，等待 ${delayMs / 1000} 秒后进行第 ${attempt} 次重试...`);
+        await new Promise(res => setTimeout(res, delayMs));
+        delayMs *= 2; // 指数递增
+      } else {
+        throw err;
+      }
+    }
+  }
+}
+
+// 启动 WhatsApp 实例
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
   const { version, isLatest } = await fetchLatestBaileysVersion();
@@ -103,24 +135,23 @@ async function startBot() {
         currentQR = await QRCode.toDataURL(qr);
         console.log('>>> [QR] 请访问 /qr 扫码');
       } catch (err) {
-        console.error('二维码生成错误:', err);
+        console.error('二维码生成失败:', err);
       }
     }
 
     if (connection === 'close') {
-      const shouldReconnect =
-        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
       const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
       console.log(`>>> 连接断开, 状态码: ${statusCode}`);
 
       if (statusCode === 515) {
-        console.log('>>> 凭据保存成功, 立即重启连接载入登录态...');
+        console.log('>>> 凭据同步更新, 立即重载会话...');
         setTimeout(startBot, 1000);
       } else if (shouldReconnect) {
         console.log('>>> 正在尝试重新连接...');
         setTimeout(startBot, 3000);
       } else {
-        console.log('>>> 设备已登出, 请清理凭据后重新扫码。');
+        console.log('>>> 设备已下线，请重新前往 /qr 扫码绑定。');
       }
     } else if (connection === 'open') {
       currentQR = null;
@@ -136,7 +167,7 @@ async function startBot() {
   });
 }
 
-// 核心业务处理
+// 核心业务流
 async function handleIncomingMessage(msg) {
   const chatId = msg.key.remoteJid;
   if (!chatId || chatId === 'status@broadcast') return;
@@ -147,7 +178,7 @@ async function handleIncomingMessage(msg) {
 
   if (!text) return;
 
-  // 1. 处理管理员审批回复指令 (例如 "1", "9" 或 "0")
+  // 1. 管理员审批指令 (回复单号数字如 "1" 或 "0" 取消)
   const adminJid = `${ADMIN_NUMBER}@s.whatsapp.net`;
   const isFromAdmin = chatId === adminJid || (isFromMe && chatId.includes(ADMIN_NUMBER));
 
@@ -155,23 +186,22 @@ async function handleIncomingMessage(msg) {
     const actionId = parseInt(text, 10);
 
     if (actionId === 0) {
-      await sock.sendMessage(chatId, { text: '❌ 已取消全部待办任务。' });
+      await sock.sendMessage(chatId, { text: '❌ 已清空待办审批队列。' });
       pendingTasks.clear();
       return;
     }
 
     const task = pendingTasks.get(actionId);
     if (task) {
-      // 匹配 MinKoNaing
       const targetJid = await resolveContactOrGroupJid(TARGET_NAME);
       if (targetJid) {
         await sock.sendMessage(targetJid, { text: task.finalText });
         await sock.sendMessage(chatId, {
-          text: `✅ [已发送] 任务 #${actionId} 已成功转发至 ${TARGET_NAME}！`
+          text: `✅ [转发成功] 任务 #${actionId} 已发送给 ${TARGET_NAME}！`
         });
       } else {
         await sock.sendMessage(chatId, {
-          text: `⚠️ 无法找到目标联系人/群聊【${TARGET_NAME}】，请确认通讯录已有聊天记录。已暂存。`
+          text: `⚠️ 找不到目标【${TARGET_NAME}】，请确认目标存在对应私聊或群名。`
         });
       }
       pendingTasks.delete(actionId);
@@ -179,42 +209,45 @@ async function handleIncomingMessage(msg) {
     }
   }
 
-  // 2. 忽略自己发出的日常业务消息
+  // 2. 忽略机器人自身发出的日常通知
   if (isFromMe) return;
 
-  // 3. 记录群聊/私聊上下文
+  // 3. 记录上下文（群聊或私聊）
   appendChatHistory(chatId, pushName, text);
 
-  // 4. 调用 AI 进行多轮对话与引用分析
+  // 4. 前置物流特征筛查：无特征闲聊直接退出，绝不调用 API
+  if (!isLogisticsRelevant(text, quotedText)) {
+    return;
+  }
+
   if (!model) return;
 
   try {
     const recentContext = getRecentContext(chatId);
-    const analysisPrompt = `
-你是一个专业的马来西亚物流出货智能助理。
-以下是当前收到的最新消息以及关联上下文，请综合分析：
+    const prompt = `
+你是一个专业的马来西亚紧固件/五金物流出货助理。
+请结合以下消息、引用内容以及群聊近期对话，研判出货与提货信息：
 
 【发件人】: ${pushName}
-【当前最新消息】: "${text}"
-${quotedText ? `【引用的上一条消息】: "${quotedText}"` : ''}
-【最近群聊/对话记录】:
+【当前收到的消息】: "${text}"
+${quotedText ? `【引用的消息内容】: "${quotedText}"` : ''}
+【近期群聊上下文记录】:
 ${recentContext}
 
-业务研判规则：
-1. 判断这些对话中是否包含出货/提货/送货/DO单相关要素。
-2. 识别提取出：
+提取与推理要求：
+1. 综合判断群聊中多人的对话。如果有人先发了出货信息，后面有人回复车牌号（如 "ANA9306"）或提货时间，请将其关联并整合进同一份出货单。
+2. 识别字段：
    - date: 日期
-   - time: 时间/提货地点备注 (如 2.30pm JAWI PROFAST)
-   - doNumber: DO单号 (如 DO-2609/003 & DO-2609/004)
-   - lorryPlate: 车牌号/运输车号 (重要：马来西亚常见车牌如 ANA9306、PKK1234 等若出现在回复中，属于车牌号，不是 DO 单号)
-   - pallets: 货物件数/托盘规格 (如 10 NORMAL PALLET)
-   - area: 送货/提货区域 (如 BATU CAVES)
-   - customer: 客户名称 (如 ADVANCE BOLTS & FASTENERS SDN BHD)
-   - phone: 联络电话
-3. 如果当前消息只是补充信息（例如引用了之前的单子补充了车牌号 "ANA9306"），必须将完整单据信息与该车牌号合并整合成一份最完整的出货通知！
-4. 如果完全只是闲聊打招呼，返回 isDelivery: false。
+   - time: 时间/地点
+   - doNumber: DO单号 (如 DO-2609/003)
+   - lorryPlate: 车牌/运输车号 (严格注意：ANA9306、PKK1234 等是马来西亚车牌号，不是 DO 单号)
+   - pallets: 托盘/件数/规格 (如 10 NORMAL PALLET)
+   - area: 送货地区
+   - customer: 客户名称
+   - phone: 联系电话
+3. 若只是无关闲聊，必须返回 isDelivery: false。
 
-请仅严格以 JSON 格式输出：
+请严格仅输出 JSON：
 {
   "isDelivery": true/false,
   "date": "...",
@@ -228,14 +261,14 @@ ${recentContext}
 }
 `;
 
-    const result = await model.generateContent(analysisPrompt);
-    const jsonText = result.response.text().trim();
-    const data = JSON.parse(jsonText);
+    const jsonRaw = await callGeminiWithRetry(prompt);
+    const cleanJson = jsonRaw.replace(/```json|```/g, '').trim();
+    const data = JSON.parse(cleanJson);
 
+    // 确认包含核心要素
     if (data.isDelivery && (data.doNumber || data.lorryPlate || data.customer)) {
       const taskId = taskCounter++;
 
-      // 格式化输出最终文案
       let output = `【出货/提货通知 / Delivery Notice】\n`;
       if (data.date) output += `📅 日期: ${data.date}\n`;
       if (data.time) output += `⏰ 时间/地点: ${data.time}\n`;
@@ -252,7 +285,6 @@ ${recentContext}
         originalChatId: chatId
       });
 
-      // 推送审批卡片至管理员
       const approvalCard = `📋【待审批出货通知 #${taskId}】
 来源: ${pushName}
 目标: ${TARGET_NAME}
@@ -265,14 +297,14 @@ ${output}
 👉 回复【0】丢弃全部待办`;
 
       await sock.sendMessage(adminJid, { text: approvalCard });
-      console.log(`[已推送审批] 任务编号: #${taskId} (包含车牌: ${data.lorryPlate || '无'})`);
+      console.log(`[已推送审批] 任务编号: #${taskId} (车牌: ${data.lorryPlate || '未提供'})`);
     }
   } catch (err) {
-    console.error('AI 解析与业务处理异常:', err);
+    console.error('AI 解析异常:', err);
   }
 }
 
-// 目标联系人/群聊解析
+// 目标联系人/群聊 JID 匹配
 async function resolveContactOrGroupJid(name) {
   try {
     const chats = await sock.groupFetchAllParticipating();
@@ -282,9 +314,8 @@ async function resolveContactOrGroupJid(name) {
       }
     }
   } catch (e) {
-    // 忽略群解析错误，继续匹配个人
+    // 忽略群解析错误
   }
-  // 也可以在环境变量中预设特定联系人的 JID
   return process.env.TARGET_JID || null;
 }
 
