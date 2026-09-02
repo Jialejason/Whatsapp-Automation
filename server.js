@@ -1,207 +1,195 @@
 const express = require('express');
-const QRCode = require('qrcode');
-const axios = require('axios');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const pino = require('pino');
-const {
-  default: makeWASocket,
-  useMultiFileAuthState,
-  DisconnectReason,
-  fetchLatestBaileysVersion
-} = require('@whiskeysockets/baileys');
+const QRCode = require('qrcode');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
-const GAS_WEBHOOK_URL = process.env.GAS_WEBHOOK_URL || '';
+const ADMIN_PHONE = process.env.ADMIN_PHONE || '601137169383';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+
+// 初始化 Gemini 客户端
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({
+  model: 'gemini-1.5-flash',
+  generationConfig: { responseMimeType: 'application/json' }
+});
+
+// 群聊映射表
+const GROUP_MAP = {
+  "Profast业务群": "120363228706613997@g.us",
+  "测试号": `${ADMIN_PHONE}@s.whatsapp.net`
+};
 
 let sock = null;
-let currentQR = '';
+let latestQrString = null;
 let isConnected = false;
 
+// 待审批队列存储 (存于内存)
+const pendingApprovals = new Map();
+
+// 启动 WhatsApp 连接
 async function startWhatsApp() {
-  console.log('>>> 正在启动 WhatsApp 客户端...');
-  const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
-  
-  let version = [2, 3000, 1015901307];
-  try {
-    const v = await fetchLatestBaileysVersion();
-    version = v.version;
-  } catch (e) {
-    console.log('使用默认 Baileys 版本');
-  }
+  const { state, saveCreds } = await useMultiFileAuthState('auth_info');
 
   sock = makeWASocket({
-    version,
     auth: state,
     logger: pino({ level: 'silent' }),
-    printQRInTerminal: true,
-    browser: ['Ubuntu', 'Chrome', '120.0.0']
+    printQRInTerminal: false
   });
 
   sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('connection.update', async (update) => {
+  sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
-
     if (qr) {
-      currentQR = qr;
+      latestQrString = qr;
       isConnected = false;
-      console.log('>>> [QR] 收到新 QR 码字符，已准备就绪');
+      console.log('>>> [QR] 已更新，请扫码');
     }
-
     if (connection === 'close') {
       isConnected = false;
-      currentQR = '';
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      console.log(`连接断开 (状态码: ${statusCode})，5秒后自动重连...`);
-      if (shouldReconnect) {
-        setTimeout(startWhatsApp, 5000);
-      }
+      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      console.log('>>> 连接断开，5秒后重连...');
+      if (shouldReconnect) setTimeout(startWhatsApp, 5000);
     } else if (connection === 'open') {
       isConnected = true;
-      currentQR = '';
-      console.log('🎉🎉 WhatsApp 已成功连接！');
+      latestQrString = null;
+      console.log('🎉🎉 WhatsApp AI Agent 已就绪！');
     }
   });
 
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
+  sock.ev.on('messages.upsert', async (m) => {
+    const msg = m.messages[0];
+    if (!msg.message || msg.key.fromMe) return;
 
-    for (const msg of messages) {
-      if (!msg.message || msg.key.fromMe) continue;
+    const senderJid = msg.key.remoteJid;
+    const text = msg.message.conversation || 
+                 msg.message.extendedTextMessage?.text || '';
 
-      const chatId = msg.key.remoteJid;
-      const messageId = msg.key.id;
-      const sender = msg.key.participant || chatId;
-      const senderName = msg.pushName || '未知用户';
+    if (!text.trim()) return;
 
-      let text = '';
-      if (msg.message.conversation) {
-        text = msg.message.conversation;
-      } else if (msg.message.extendedTextMessage?.text) {
-        text = msg.message.extendedTextMessage.text;
-      }
+    const adminJid = `${ADMIN_PHONE}@s.whatsapp.net`;
 
-      if (!text || !text.trim()) continue;
-
-      console.log(`[消息进站] ${chatId} | ${senderName}: ${text}`);
-
-      if (GAS_WEBHOOK_URL) {
+    // 1. 如果是来自管理员的私聊指令 (审批逻辑)
+    if (senderJid === adminJid) {
+      const trimmed = text.trim().toLowerCase();
+      if (pendingApprovals.has(trimmed)) {
+        const item = pendingApprovals.get(trimmed);
         try {
-          await axios.post(GAS_WEBHOOK_URL, {
-            idMessage: messageId,
-            sourceChatId: chatId,
-            sender: sender,
-            senderName: senderName,
-            text: text,
-            timestamp: msg.messageTimestamp || Math.floor(Date.now() / 1000)
-          }, { timeout: 15000 });
+          await sock.sendMessage(item.targetChatId, { text: item.draftMessage });
+          await sock.sendMessage(adminJid, { text: `✅ 已成功转发至【${item.targetGroupName}】！` });
+          pendingApprovals.delete(trimmed);
         } catch (err) {
-          console.error('推送 Google Apps Script 失败:', err.message);
+          await sock.sendMessage(adminJid, { text: `❌ 转发失败: ${err.message}` });
         }
+        return;
+      } else if (trimmed.startsWith('0') || trimmed === 'cancel' || trimmed === '取消') {
+        const taskNum = trimmed.replace(/[^0-9]/g, '');
+        if (pendingApprovals.has(taskNum)) {
+          pendingApprovals.delete(taskNum);
+          await sock.sendMessage(adminJid, { text: `🗑️ 任务 #${taskNum} 已取消。` });
+        } else {
+          pendingApprovals.clear();
+          await sock.sendMessage(adminJid, { text: `🗑️ 已清空待审批队列。` });
+        }
+        return;
       }
     }
+
+    // 2. 收到进站消息 -> AI 提炼与审批卡片生成
+    console.log(`[消息进站] 来源: ${senderJid} 内容: ${text.slice(0, 30)}...`);
+    handleIncomingMessage(senderJid, text, msg.pushName || '未知发送者');
   });
 }
 
-// 获取即时二维码图片（直接返回图片流，不依赖复杂轮询）
-app.get('/qr.png', async (req, res) => {
-  if (!currentQR) {
-    return res.status(404).send('QR code not ready yet');
+// AI 提炼与生成审批请求
+async function handleIncomingMessage(sourceJid, text, senderName) {
+  if (!GEMINI_API_KEY) {
+    console.error('未配置 GEMINI_API_KEY');
+    return;
   }
+
+  const groupKeys = Object.keys(GROUP_MAP).join('、');
+  const prompt = `你是一名专业紧固件/工业品物流出货助理。请分析以下进站消息：
+发件人: ${senderName}
+原始文本:
+"""
+${text}
+"""
+
+任务：
+1. 判断是否包含出货通知、提货、DO单号、托盘数等业务信息。若是闲聊客套，isMeaningful 设为 false。
+2. 提取核心事实，排版为工整专业、准备发给下游群的正式通知文案（保留DO号、托盘数、地点、联系人等，格式美观）。
+3. 候选目标群聊名称：${groupKeys}。选择最适合的目标群（默认选 Profast业务群）。
+
+严格按 JSON 输出：
+{
+  "isMeaningful": true,
+  "draftMessage": "排版工整的最终通知文案",
+  "suggestedGroupName": "Profast业务群"
+}`;
+
   try {
-    const qrBuffer = await QRCode.toBuffer(currentQR, { width: 300, margin: 2 });
-    res.setHeader('Content-Type', 'image/png');
-    res.send(qrBuffer);
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    const resJson = JSON.parse(response.text());
+    
+    if (!resJson.isMeaningful) return;
+
+    // 分配编号 (1~9)
+    const taskNum = String((pendingApprovals.size % 9) + 1);
+    const targetGroupName = resJson.suggestedGroupName || 'Profast业务群';
+    const targetChatId = GROUP_MAP[targetGroupName] || GROUP_MAP['Profast业务群'];
+
+    pendingApprovals.set(taskNum, {
+      draftMessage: resJson.draftMessage,
+      targetGroupName: targetGroupName,
+      targetChatId: targetChatId
+    });
+
+    // 推送审批卡片到你的私聊 WhatsApp
+    const adminJid = `${ADMIN_PHONE}@s.whatsapp.net`;
+    const approvalPrompt = `📋 *【待审批出货通知 #${taskNum}】*
+*来源*: ${senderName}
+*目标群*: ${targetGroupName}
+
+*预定发送文案*:
+--------------------------------
+${resJson.draftMessage}
+--------------------------------
+👉 *回复【${taskNum}】确认立即转发*
+👉 *回复【0】或【取消】丢弃*`;
+
+    await sock.sendMessage(adminJid, { text: approvalPrompt });
+    console.log(`[已推送审批] 任务编号: #${taskNum}`);
+
   } catch (err) {
-    res.status(500).send('Error generating QR');
+    console.error('AI 解析异常:', err);
   }
-});
+}
 
-// 状态查询
+// 网页状态与二维码接口
 app.get('/status', (req, res) => {
-  res.json({ connected: isConnected, hasQR: !!currentQR });
+  res.json({ connected: isConnected, pendingTasks: pendingApprovals.size });
 });
 
-// 主扫码页面
-app.get('/qr', (req, res) => {
+app.get('/qr', async (req, res) => {
+  if (isConnected) return res.send('<h2 style="color:green;text-align:center;">✅ 已经成功连接！</h2>');
+  if (!latestQrString) return res.send('<h2 style="text-align:center;">二维码生成中，请刷新...</h2>');
+  const qrImage = await QRCode.toDataURL(latestQrString);
   res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <meta charset="utf-8">
-      <title>WhatsApp 扫码授权</title>
-      <style>
-        body { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 90vh; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f0f2f5; margin: 0; }
-        .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); text-align: center; width: 320px; }
-        .qr-wrapper { width: 280px; height: 280px; margin: 15px auto; display: flex; align-items: center; justify-content: center; border: 1px solid #e0e0e0; border-radius: 8px; background: #fafafa; }
-        img { width: 100%; height: 100%; border-radius: 8px; }
-        p { color: #555; font-size: 14px; }
-      </style>
-    </head>
-    <body>
-      <div class="card">
-        <h2 id="msg" style="margin-top:0;">WhatsApp 扫码登录</h2>
-        <div class="qr-wrapper">
-          <div id="loading">⏳ 连接建立中...</div>
-          <img id="qr-image" style="display:none;" />
-        </div>
-        <p id="sub">请打开 WhatsApp -> 已关联的设备 扫码</p>
-      </div>
-
-      <script>
-        async function check() {
-          try {
-            const res = await fetch('/status');
-            const data = await res.json();
-            if (data.connected) {
-              document.getElementById('msg').innerText = '✅ 已经成功连接！';
-              document.getElementById('msg').style.color = '#1b5e20';
-              document.getElementById('loading').style.display = 'none';
-              document.getElementById('qr-image').style.display = 'none';
-              document.getElementById('sub').innerText = '网关正在运行中，可以关闭此网页。';
-              return;
-            }
-            if (data.hasQR) {
-              document.getElementById('loading').style.display = 'none';
-              const img = document.getElementById('qr-image');
-              img.src = '/qr.png?t=' + Date.now();
-              img.style.display = 'block';
-            }
-          } catch(e) {}
-        }
-        setInterval(check, 2000);
-        check();
-      </script>
-    </body>
-    </html>
+    <div style="display:flex;flex-direction:column;align-items:center;margin-top:50px;">
+      <h2>请用 WhatsApp 扫码连接 AI Agent</h2>
+      <img src="${qrImage}" style="width:300px;height:300px;border:1px solid #ccc;" />
+    </div>
   `);
 });
 
-app.post('/send', async (req, res) => {
-  const { to, text } = req.body;
-  if (!isConnected || !sock) {
-    return res.status(503).json({ success: false, error: 'WhatsApp 未连接' });
-  }
-  if (!to || !text) {
-    return res.status(400).json({ success: false, error: '缺少 to 或 text' });
-  }
-
-  try {
-    let targetJid = to.trim();
-    if (!targetJid.includes('@')) {
-      targetJid = `${targetJid}@s.whatsapp.net`;
-    }
-    const result = await sock.sendMessage(targetJid, { text: text });
-    res.json({ success: true, messageId: result.key.id });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
 app.listen(PORT, () => {
-  console.log(`🚀 Gateway 正在监听端口: ${PORT}`);
+  console.log(`Gateway 监听端口: ${PORT}`);
   startWhatsApp();
 });
