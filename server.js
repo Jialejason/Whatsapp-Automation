@@ -13,10 +13,10 @@ const app = express();
 const PORT = process.env.PORT || 10000;
 
 const ADMIN_NUMBER = '601137169383'; // Jia Le
-const TARGET_NAME = 'MinKoNaing';    // 最终接收目标
+const TARGET_NAME = 'MinKoNaing';    // 出货单转发目标
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-// 初始化 Gemini (使用当前支持的 3.6-flash)
+// 初始化 Gemini 3.6-flash
 let model = null;
 if (GEMINI_API_KEY) {
   const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
@@ -26,14 +26,13 @@ if (GEMINI_API_KEY) {
   });
 }
 
-// 内存状态
 let currentQR = null;
 let sock = null;
-let pendingTasks = new Map(); // taskId -> { finalText, originalChatId }
+let pendingTasks = new Map();
 let taskCounter = 1;
 
-// 群组与对话上下文缓存（最近10分钟滑动窗口，保留最近6条）
-const chatHistoryMap = new Map(); // chatId -> [ { sender, text, timestamp } ]
+// 对话上下文缓存（10分钟滑动窗口，保留最近8条）
+const chatHistoryMap = new Map();
 
 function appendChatHistory(chatId, sender, text) {
   if (!text) return;
@@ -41,7 +40,7 @@ function appendChatHistory(chatId, sender, text) {
   let history = chatHistoryMap.get(chatId) || [];
   history = history.filter(item => now - item.timestamp < 10 * 60 * 1000);
   history.push({ sender, text, timestamp: now });
-  if (history.length > 6) history.shift();
+  if (history.length > 8) history.shift();
   chatHistoryMap.set(chatId, history);
 }
 
@@ -50,18 +49,20 @@ function getRecentContext(chatId) {
   return history.map(h => `${h.sender}: ${h.text}`).join('\n');
 }
 
-// 辅助：全面解析 WhatsApp 消息及引用（Quote）内容
+// 辅助：提取消息体、引用内容及提及人
 function extractMessageContent(msg) {
-  if (!msg.message) return { text: '', quotedText: '' };
+  if (!msg.message) return { text: '', quotedText: '', mentions: [] };
 
   let text = '';
   let quotedText = '';
+  let mentions = [];
 
   const m = msg.message;
   if (m.conversation) {
     text = m.conversation;
   } else if (m.extendedTextMessage) {
     text = m.extendedTextMessage.text || '';
+    mentions = m.extendedTextMessage.contextInfo?.mentionedJid || [];
     const ctx = m.extendedTextMessage.contextInfo;
     if (ctx && ctx.quotedMessage) {
       const qm = ctx.quotedMessage;
@@ -71,47 +72,60 @@ function extractMessageContent(msg) {
     text = m.imageMessage.caption || '';
   }
 
-  return { text: text.trim(), quotedText: quotedText.trim() };
+  return { text: text.trim(), quotedText: quotedText.trim(), mentions };
 }
 
-// 前置关键词与马来西亚车牌正则过滤（避免非出货消息浪费免费配额）
-function isLogisticsRelevant(text, quotedText) {
-  const combined = `${text} ${quotedText}`.toLowerCase();
-  
-  // 物流高频业务词
+// 紧固件调度中枢：前置业务场景分流
+function preClassifyMessage(text, quotedText, mentions) {
+  const raw = `${text} ${quotedText}`;
+  const lower = raw.toLowerCase();
+
+  // 1. 任务艾特强提醒 (针对 @Profast Jiale)
+  const isMentioned = lower.includes('@profast jiale') || mentions.some(jid => jid.includes(ADMIN_NUMBER));
+  if (isMentioned) return 'TASK_MENTION';
+
+  // 2. 货柜海运船期详情 (广州/义乌/UPDATE/到港/ON SHIP/海关查验/安排装柜等)
+  if ((raw.includes('广州') || raw.includes('义乌') || lower.includes('update')) && (lower.includes('gc') || lower.includes('zc'))) {
+    return 'CONTAINER_STATUS';
+  }
+
+  // 3. 客户询价与库存确认 (quote, 现货, 多少钱, csk, sds, bolt, screw 等五金特征)
+  if (lower.includes('quote') || lower.includes('询价') || lower.includes('现货') || lower.includes('多少钱')) {
+    return 'INQUIRY';
+  }
+
+  // 4. 出货与来货通知 (DO单、车牌号、托盘、送货、到货、ZC/GC)
   const logisticsKeywords = [
-    'do', 'pallet', 'lorry', 'plate', 'batu', 'jawi', 'profast',
-    '客户', '日期', '车牌', '提货', '送货', '出货', '单号', '箱', 'pcs'
+    'do', 'pallet', 'normal pallet', 'long pallet', 'lorry', 'plate',
+    'zc', 'gc', '出货', '到货', 'incoming', '送货', 'batu caves', 'jawi profast'
   ];
-  const hitKeyword = logisticsKeywords.some(kw => combined.includes(kw));
+  const hasLogisticsKeyword = logisticsKeywords.some(kw => lower.includes(kw));
+  const hasPlateNumber = /\b[A-Za-z]{1,3}\s*\d{1,4}\b/.test(raw);
 
-  // 马来西亚车牌正则（如 ANA9306, PKK 1234, W 1234 A, VAA 888）
-  const plateRegex = /\b[A-Za-z]{1,3}\s*\d{1,4}\s*[A-Za-z]?\b/;
-  const hitPlate = plateRegex.test(combined);
+  if (hasLogisticsKeyword || hasPlateNumber) return 'LOGISTICS';
 
-  return hitKeyword || hitPlate;
+  return 'IGNORE';
 }
 
-// 带自动退避的 Gemini 调用（防 429 崩溃）
-async function callGeminiWithRetry(prompt, retries = 2, delayMs = 3000) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
+// 防 429 频率限制调用机制
+async function callGemini(prompt) {
+  let delay = 3000;
+  for (let i = 0; i < 2; i++) {
     try {
-      const result = await model.generateContent(prompt);
-      return result.response.text().trim();
-    } catch (err) {
-      const errStr = String(err);
-      if (errStr.includes('429') && attempt < retries) {
-        console.warn(`[限频警告] 遇到 429，等待 ${delayMs / 1000} 秒后进行第 ${attempt} 次重试...`);
-        await new Promise(res => setTimeout(res, delayMs));
-        delayMs *= 2; // 指数递增
+      const res = await model.generateContent(prompt);
+      return res.response.text().trim();
+    } catch (e) {
+      if (String(e).includes('429') && i === 0) {
+        console.log(`[429 限频保护] 稍候 ${delay / 1000} 秒后自动重试...`);
+        await new Promise(r => setTimeout(r, delay));
       } else {
-        throw err;
+        throw e;
       }
     }
   }
 }
 
-// 启动 WhatsApp 实例
+// 启动 WhatsApp Gateway
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
   const { version, isLatest } = await fetchLatestBaileysVersion();
@@ -129,33 +143,20 @@ async function startBot() {
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
-
     if (qr) {
-      try {
-        currentQR = await QRCode.toDataURL(qr);
-        console.log('>>> [QR] 请访问 /qr 扫码');
-      } catch (err) {
-        console.error('二维码生成失败:', err);
-      }
+      currentQR = await QRCode.toDataURL(qr);
+      console.log('>>> [QR] 请访问 /qr 扫码');
     }
-
     if (connection === 'close') {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      console.log(`>>> 连接断开, 状态码: ${statusCode}`);
-
-      if (statusCode === 515) {
-        console.log('>>> 凭据同步更新, 立即重载会话...');
+      const code = lastDisconnect?.error?.output?.statusCode;
+      if (code === 515) {
         setTimeout(startBot, 1000);
-      } else if (shouldReconnect) {
-        console.log('>>> 正在尝试重新连接...');
+      } else if (code !== DisconnectReason.loggedOut) {
         setTimeout(startBot, 3000);
-      } else {
-        console.log('>>> 设备已下线，请重新前往 /qr 扫码绑定。');
       }
     } else if (connection === 'open') {
       currentQR = null;
-      console.log('🎉🎉 WhatsApp AI Agent 已就绪！');
+      console.log('🎉🎉 紧固件供应链业务调度中枢已就绪！');
     }
   });
 
@@ -167,125 +168,234 @@ async function startBot() {
   });
 }
 
-// 核心业务流
+// 核心业务中枢路由
 async function handleIncomingMessage(msg) {
   const chatId = msg.key.remoteJid;
   if (!chatId || chatId === 'status@broadcast') return;
 
   const isFromMe = msg.key.fromMe;
   const pushName = msg.pushName || '未知用户';
-  const { text, quotedText } = extractMessageContent(msg);
+  const { text, quotedText, mentions } = extractMessageContent(msg);
+  const adminJid = `${ADMIN_NUMBER}@s.whatsapp.net`;
 
   if (!text) return;
 
-  // 1. 管理员审批指令 (回复单号数字如 "1" 或 "0" 取消)
-  const adminJid = `${ADMIN_NUMBER}@s.whatsapp.net`;
+  // 1. 管理员指令交互 (回复任务编号如 "1" 或 "0" 取消)
   const isFromAdmin = chatId === adminJid || (isFromMe && chatId.includes(ADMIN_NUMBER));
-
   if (isFromAdmin && /^\d+$/.test(text)) {
     const actionId = parseInt(text, 10);
-
     if (actionId === 0) {
-      await sock.sendMessage(chatId, { text: '❌ 已清空待办审批队列。' });
+      await sock.sendMessage(chatId, { text: '❌ 已清空全部待办审批。' });
       pendingTasks.clear();
       return;
     }
-
     const task = pendingTasks.get(actionId);
     if (task) {
       const targetJid = await resolveContactOrGroupJid(TARGET_NAME);
       if (targetJid) {
         await sock.sendMessage(targetJid, { text: task.finalText });
-        await sock.sendMessage(chatId, {
-          text: `✅ [转发成功] 任务 #${actionId} 已发送给 ${TARGET_NAME}！`
-        });
+        await sock.sendMessage(chatId, { text: `✅ [已转发] 任务 #${actionId} 已成功下发至 ${TARGET_NAME}！` });
       } else {
-        await sock.sendMessage(chatId, {
-          text: `⚠️ 找不到目标【${TARGET_NAME}】，请确认目标存在对应私聊或群名。`
-        });
+        await sock.sendMessage(chatId, { text: `⚠️ 未能匹配到目标【${TARGET_NAME}】，请确认通讯录已有聊天窗口。` });
       }
       pendingTasks.delete(actionId);
       return;
     }
   }
 
-  // 2. 忽略机器人自身发出的日常通知
   if (isFromMe) return;
 
-  // 3. 记录上下文（群聊或私聊）
   appendChatHistory(chatId, pushName, text);
 
-  // 4. 前置物流特征筛查：无特征闲聊直接退出，绝不调用 API
-  if (!isLogisticsRelevant(text, quotedText)) {
+  // 2. 调度场景研判
+  const scene = preClassifyMessage(text, quotedText, mentions);
+  if (scene === 'IGNORE' || !model) return;
+
+  // -------------------------------------------------------------
+  // 场景 1：【有任务@Profast Jiale】（本地直推，零 API 消耗）
+  // -------------------------------------------------------------
+  if (scene === 'TASK_MENTION') {
+    const taskNotice = `🔔【有任务@Profast Jiale】
+------------------------------------
+📌 派工来源: ${pushName}
+💬 任务指示:
+"${text}"
+${quotedText ? `\n📎 关联引用原单:\n"${quotedText}"` : ''}
+------------------------------------
+⏰ 请及时在工作群跟进！`;
+
+    await sock.sendMessage(adminJid, { text: taskNotice });
+    console.log(`[已推送艾特任务] 来源: ${pushName}`);
     return;
   }
 
-  if (!model) return;
+  // -------------------------------------------------------------
+  // 场景 2：【货柜船期详情】（状态研判与盘托数学计算）
+  // -------------------------------------------------------------
+  if (scene === 'CONTAINER_STATUS') {
+    const containerPrompt = `
+你是一个专业的马来西亚五金紧固件海运进柜分析专家。
+请仔细解析以下【货柜船期更新清单】，并严格按照规则研判并统计盘托数量：
 
-  try {
-    const recentContext = getRecentContext(chatId);
-    const prompt = `
-你是一个专业的马来西亚紧固件/五金物流出货助理。
-请结合以下消息、引用内容以及群聊近期对话，研判出货与提货信息：
+【清单原文】:
+${text}
 
-【发件人】: ${pushName}
-【当前收到的消息】: "${text}"
-${quotedText ? `【引用的消息内容】: "${quotedText}"` : ''}
-【近期群聊上下文记录】:
-${recentContext}
+【研判与计算规则】：
+1. 状态分类：
+   - "未到" (未就绪/在途/卡关状态)：
+     包括但不限于："预计**到港"、"海关查验还未放行"、"询问运输几时派送中"、"预计**拉进运输仓库"、"ON SHIP"、"还未安排装柜"、"还未收到资料"。
+   - "将到" (已确认派送)：
+     明确注明 "运输安排**派送" (运输公司已定下派送日期准备送达)。
+2. 盘托数量计算：
+   - 提取每一行对应的托盘数（例如 "(4P)" -> 4，"3 NORMAL PALLET" -> 3，"2 LONG" -> 2）。
+   - 将所有属于 "未到" 状态的 Normal 与 Long 盘托数值进行整型累加，计算出 "未到盘托总数"。
+   - 将所有属于 "将到" 状态的 Normal 与 Long 盘托数值进行整型累加，计算出 "将到盘托总数"。
+3. 生成一份规整精简的各口岸（广州/义乌等）单号状态摘要。
 
-提取与推理要求：
-1. 综合判断群聊中多人的对话。如果有人先发了出货信息，后面有人回复车牌号（如 "ANA9306"）或提货时间，请将其关联并整合进同一份出货单。
-2. 识别字段：
-   - date: 日期
-   - time: 时间/地点
-   - doNumber: DO单号 (如 DO-2609/003)
-   - lorryPlate: 车牌/运输车号 (严格注意：ANA9306、PKK1234 等是马来西亚车牌号，不是 DO 单号)
-   - pallets: 托盘/件数/规格 (如 10 NORMAL PALLET)
-   - area: 送货地区
-   - customer: 客户名称
-   - phone: 联系电话
-3. 若只是无关闲聊，必须返回 isDelivery: false。
-
-请严格仅输出 JSON：
+仅输出严格 JSON 格式：
 {
-  "isDelivery": true/false,
-  "date": "...",
-  "time": "...",
-  "doNumber": "...",
-  "lorryPlate": "...",
-  "pallets": "...",
-  "area": "...",
-  "customer": "...",
-  "phone": "..."
+  "undeliveredPallets": 0,
+  "arrivingPallets": 0,
+  "summaryList": "简洁分行清单(港口/单号/状态)"
 }
 `;
 
-    const jsonRaw = await callGeminiWithRetry(prompt);
-    const cleanJson = jsonRaw.replace(/```json|```/g, '').trim();
-    const data = JSON.parse(cleanJson);
+    try {
+      const rawRes = await callGemini(containerPrompt);
+      const data = JSON.parse(rawRes.replace(/```json|```/g, '').trim());
 
-    // 确认包含核心要素
-    if (data.isDelivery && (data.doNumber || data.lorryPlate || data.customer)) {
-      const taskId = taskCounter++;
+      const containerCard = `🚢【货柜船期详情】
+------------------------------------
+📊【盘托统计】：
+⏳【未到货柜】: ${data.undeliveredPallets} 盘托 (船运中/海关查验/待拉仓)
+🚚【将到货柜】: ${data.arrivingPallets} 盘托 (已安排派送中)
+------------------------------------
+📋【进柜状态概览】：
+${data.summaryList}
+------------------------------------
+💡 此简报仅供过目与备货仓位规划。`;
 
-      let output = `【出货/提货通知 / Delivery Notice】\n`;
-      if (data.date) output += `📅 日期: ${data.date}\n`;
-      if (data.time) output += `⏰ 时间/地点: ${data.time}\n`;
-      if (data.doNumber) output += `📄 DO 单号: ${data.doNumber}\n`;
-      if (data.lorryPlate) output += `🚛 车牌号 (Lorry Plate): ${data.lorryPlate}\n`;
-      if (data.pallets) output += `📦 货物规格: ${data.pallets}\n`;
-      if (data.area) output += `📍 送货区域: ${data.area}\n`;
-      if (data.customer) output += `🏢 客户名称: ${data.customer}\n`;
-      if (data.phone) output += `📞 联络电话: ${data.phone}\n`;
-      output += `\n请相关人员跟进安排，谢谢！`;
+      await sock.sendMessage(adminJid, { text: containerCard });
+      console.log(`[已推送货柜船期] 未到: ${data.undeliveredPallets}, 将到: ${data.arrivingPallets}`);
+    } catch (e) {
+      console.error('货柜船期详情解析异常:', e);
+    }
+    return;
+  }
 
-      pendingTasks.set(taskId, {
-        finalText: output,
-        originalChatId: chatId
-      });
+  // -------------------------------------------------------------
+  // 场景 3：【询价/物】（客户询价，纯过目监控）
+  // -------------------------------------------------------------
+  if (scene === 'INQUIRY') {
+    const inquiryPrompt = `
+你是一个专业的五金紧固件业务助理。分析以下群聊询价消息：
+最新消息: "${text}"
+引用内容: "${quotedText}"
+群聊上下文:
+${getRecentContext(chatId)}
 
-      const approvalCard = `📋【待审批出货通知 #${taskId}】
+请提炼：
+1. customer: 客户或咨询方名称
+2. items: 询问的具体产品、规格、牙型/头型、材质与数量 (例如 "SS304 CSK SDS #6x5/8 1 ctn", "Hex Bolt M10x1.5x30 11k")
+3. internalReply: 内部同事是否已有回应或提供报价 (若有简要概述，没有则填 "暂未回复")
+
+仅输出 JSON:
+{
+  "customer": "...",
+  "items": "...",
+  "internalReply": "..."
+}
+`;
+
+    try {
+      const rawRes = await callGemini(inquiryPrompt);
+      const data = JSON.parse(rawRes.replace(/```json|```/g, '').trim());
+
+      const inquiryCard = `💬【询价/物】
+------------------------------------
+👤 咨询客户: ${data.customer || pushName}
+🔩 紧固件规格: ${data.items || '未注明'}
+📌 内部跟进: ${data.internalReply}
+------------------------------------
+👀 询价动态已过目，无需转发。`;
+
+      await sock.sendMessage(adminJid, { text: inquiryCard });
+      console.log(`[已推送询价动态] 客户: ${data.customer}`);
+    } catch (e) {
+      console.error('询价解析异常:', e);
+    }
+    return;
+  }
+
+  // -------------------------------------------------------------
+  // 场景 4：【出货/来货】（DO出货审批 或 进货到货入库）
+  // -------------------------------------------------------------
+  if (scene === 'LOGISTICS') {
+    const logisticsPrompt = `
+你是一个专业的五金紧固件仓储物流调度员。
+请结合以下消息、引用内容以及群聊历史进行深度研判：
+
+发件人: ${pushName}
+当前消息: "${text}"
+引用内容: "${quotedText}"
+上下文记录:
+${getRecentContext(chatId)}
+
+研判规则：
+1. 区分【出货】与【到货/来货】：
+   - 【来货/到货通知】：消息中没有送货客户名称与地点，核心为中国直发单号（如 ZC2600858, GC26005152）以及托盘详情（如 3 NORMAL PALLET, 4 LONG PALLET）。
+   - 【出货通知】：包含本地送货客户名称、区域（如 BATU CAVES）、DO单号、发货车牌号等。
+2. 遇到车牌补充：如果当前消息或上下文补充了马来西亚车牌（如 ANA9306），务必与引用的单据合并生成完整文案，车牌不要误判为单号。
+
+仅输出 JSON:
+{
+  "isLogistics": true/false,
+  "type": "出货" 或 "来货",
+  "date": "...",
+  "time": "...",
+  "doOrChinaNo": "DO单号或中国单号(ZC/GC)",
+  "lorryPlate": "车牌号(如适用)",
+  "pallets": "托盘/件数规格",
+  "area": "送货区域(出货适用)",
+  "customer": "客户名称(出货适用)",
+  "phone": "联系电话"
+}
+`;
+
+    try {
+      const rawRes = await callGemini(logisticsPrompt);
+      const data = JSON.parse(rawRes.replace(/```json|```/g, '').trim());
+
+      if (data.isLogistics) {
+        const taskId = taskCounter++;
+        let output = '';
+
+        if (data.type === '来货') {
+          output = `【到货/来货通知】\n`;
+          if (data.date) output += `📅 日期: ${data.date}\n`;
+          if (data.doOrChinaNo) output += `📦 中国单号: ${data.doOrChinaNo}\n`;
+          if (data.pallets) output += `🪵 托盘详情: ${data.pallets}\n`;
+          output += `\n请仓库注意接卸核对入库！`;
+        } else {
+          output = `【出货通知 / Delivery Notice】\n`;
+          if (data.date) output += `📅 日期: ${data.date}\n`;
+          if (data.time) output += `⏰ 时间/地点: ${data.time}\n`;
+          if (data.doOrChinaNo) output += `📄 DO 单号: ${data.doOrChinaNo}\n`;
+          if (data.lorryPlate) output += `🚛 车牌号: ${data.lorryPlate}\n`;
+          if (data.pallets) output += `📦 货物规格: ${data.pallets}\n`;
+          if (data.area) output += `📍 送货区域: ${data.area}\n`;
+          if (data.customer) output += `🏢 客户名称: ${data.customer}\n`;
+          if (data.phone) output += `📞 联络电话: ${data.phone}\n`;
+          output += `\n请相关人员跟进安排，谢谢！`;
+        }
+
+        pendingTasks.set(taskId, {
+          finalText: output,
+          originalChatId: chatId
+        });
+
+        const approvalCard = `📋【待审批 - 出货/来货 #${taskId}】
+类型: ${data.type}通知
 来源: ${pushName}
 目标: ${TARGET_NAME}
 
@@ -296,15 +406,16 @@ ${output}
 👉 回复【${taskId}】确认立即转发
 👉 回复【0】丢弃全部待办`;
 
-      await sock.sendMessage(adminJid, { text: approvalCard });
-      console.log(`[已推送审批] 任务编号: #${taskId} (车牌: ${data.lorryPlate || '未提供'})`);
+        await sock.sendMessage(adminJid, { text: approvalCard });
+        console.log(`[已推送审批 - 出货/来货] #${taskId} (${data.type})`);
+      }
+    } catch (e) {
+      console.error('物流出货/来货解析异常:', e);
     }
-  } catch (err) {
-    console.error('AI 解析异常:', err);
   }
 }
 
-// 目标联系人/群聊 JID 匹配
+// 目标联系人/群聊解析
 async function resolveContactOrGroupJid(name) {
   try {
     const chats = await sock.groupFetchAllParticipating();
@@ -313,21 +424,19 @@ async function resolveContactOrGroupJid(name) {
         return jid;
       }
     }
-  } catch (e) {
-    // 忽略群解析错误
-  }
+  } catch (e) {}
   return process.env.TARGET_JID || null;
 }
 
-// 路由服务
+// 网页路由
 app.get('/qr', (req, res) => {
   if (currentQR) {
     res.send(`
       <!DOCTYPE html>
       <html>
-        <head><title>WhatsApp 扫码登录</title><meta http-equiv="refresh" content="5"></head>
+        <head><title>WhatsApp 扫码中枢</title><meta http-equiv="refresh" content="5"></head>
         <body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:90vh;font-family:sans-serif;">
-          <h2>请使用 WhatsApp 扫描二维码</h2>
+          <h2>请使用 WhatsApp 扫描二维码连接调度中枢</h2>
           <img src="${currentQR}" style="width:300px;height:300px;" />
           <p style="color:gray;">每 5 秒自动刷新状态</p>
         </body>
@@ -337,18 +446,18 @@ app.get('/qr', (req, res) => {
     res.send(`
       <!DOCTYPE html>
       <html>
-        <head><title>WhatsApp 状态</title><meta http-equiv="refresh" content="5"></head>
+        <head><title>调度中枢状态</title><meta http-equiv="refresh" content="5"></head>
         <body style="display:flex;align-items:center;justify-content:center;height:90vh;font-family:sans-serif;">
-          <h2 style="color:green;">🎉 WhatsApp 已成功连接！无需扫码。</h2>
+          <h2 style="color:green;">🎉 紧固件供应链业务调度中枢正在运行！</h2>
         </body>
       </html>
     `);
   }
 });
 
-app.get('/', (req, res) => res.send('WhatsApp AI Automation is Live.'));
+app.get('/', (req, res) => res.send('Fastener Supply Chain AI Dispatch Center Live.'));
 
 app.listen(PORT, () => {
-  console.log(`Gateway 监听端口: ${PORT}`);
+  console.log(`调度中枢网关启动，监听端口: ${PORT}`);
   startBot();
 });
