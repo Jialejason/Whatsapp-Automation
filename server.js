@@ -29,9 +29,9 @@ if (GEMINI_API_KEY) {
   });
 }
 
-// 目标群配置
+// 目标接收方配置（群聊或个人）
 const GROUP_MAP = {
-  "Profast业务群": "120363228706613997@g.us",
+  "MinKoNaing": "601133577714@s.whatsapp.net",
   "测试号": `${ADMIN_PHONE}@s.whatsapp.net`
 };
 
@@ -155,7 +155,7 @@ ${text}
 任务：
 1. 判断是否包含出货通知、提货、DO单号、托盘数等业务信息。若是闲聊客套，isMeaningful 设为 false。
 2. 提取核心事实，排版为工整专业、准备发给下游群的正式通知文案（保留DO号、托盘数、地点、联系人等，格式美观）。
-3. 候选目标群聊名称：${groupKeys}。选择最适合的目标群（默认选 Profast业务群）。
+3. 候选目标群聊名称：${groupKeys}。选择最适合的目标群（默认选 'MinKoNaing'）。
 
 严格按 JSON 输出：
 {
@@ -172,8 +172,8 @@ ${text}
     if (!resJson.isMeaningful) return;
 
     const taskNum = String((pendingApprovals.size % 9) + 1);
-    const targetGroupName = resJson.suggestedGroupName || 'Profast业务群';
-    const targetChatId = GROUP_MAP[targetGroupName] || GROUP_MAP['Profast业务群'];
+    const targetGroupName = resJson.suggestedGroupName || 'MinKoNaing';
+    const targetChatId = GROUP_MAP[targetGroupName] || GROUP_MAP['MinKoNaing'];
 
     pendingApprovals.set(taskNum, {
       draftMessage: resJson.draftMessage,
