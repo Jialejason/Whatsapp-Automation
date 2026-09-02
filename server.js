@@ -15,8 +15,8 @@ const PORT = process.env.PORT || 10000;
 const ADMIN_NUMBER = '601137169383'; // Jia Le
 const TARGET_NAME = 'MinKoNaing';    // 出货单转发目标
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const INQUIRY_TIMEOUT_MS = 15 * 60 * 1000; // 询价超时时限：15 分钟
 
-// 初始化 Gemini 3.6-flash
 let model = null;
 if (GEMINI_API_KEY) {
   const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
@@ -31,7 +31,13 @@ let sock = null;
 let pendingTasks = new Map();
 let taskCounter = 1;
 
-// 对话上下文缓存（10分钟滑动窗口，保留最近8条）
+// 待处理询价跟踪池：chatId -> { customer, items, timer, timestamp, pushName, groupCompany }
+const activeInquiries = new Map();
+
+// 群组名称缓存
+const groupNameCache = new Map();
+
+// 10 分钟滑动窗口对话记录
 const chatHistoryMap = new Map();
 
 function appendChatHistory(chatId, sender, text) {
@@ -49,7 +55,25 @@ function getRecentContext(chatId) {
   return history.map(h => `${h.sender}: ${h.text}`).join('\n');
 }
 
-// 辅助：提取消息体、引用内容及提及人
+// 提取群名称或客户公司后缀
+async function resolveChatGroupName(chatId) {
+  if (!chatId.endsWith('@g.us')) return '';
+  if (groupNameCache.has(chatId)) return groupNameCache.get(chatId);
+
+  try {
+    const meta = await sock.groupMetadata(chatId);
+    let name = meta.subject || '';
+    if (name.toUpperCase().includes('PROFAST -')) {
+      name = name.replace(/PROFAST\s*-\s*/i, '').trim();
+    }
+    groupNameCache.set(chatId, name);
+    return name;
+  } catch (err) {
+    return '';
+  }
+}
+
+// 辅助：提取消息正文、引用内容及提及人
 function extractMessageContent(msg) {
   if (!msg.message) return { text: '', quotedText: '', mentions: [] };
 
@@ -75,26 +99,30 @@ function extractMessageContent(msg) {
   return { text: text.trim(), quotedText: quotedText.trim(), mentions };
 }
 
-// 紧固件调度中枢：前置业务场景分流
+// 业务场景前置筛选
 function preClassifyMessage(text, quotedText, mentions) {
   const raw = `${text} ${quotedText}`;
   const lower = raw.toLowerCase();
 
-  // 1. 任务艾特强提醒 (针对 @Profast Jiale)
+  // 1. @Profast Jiale
   const isMentioned = lower.includes('@profast jiale') || mentions.some(jid => jid.includes(ADMIN_NUMBER));
   if (isMentioned) return 'TASK_MENTION';
 
-  // 2. 货柜海运船期详情 (广州/义乌/UPDATE/到港/ON SHIP/海关查验/安排装柜等)
+  // 2. 货柜船期详情
   if ((raw.includes('广州') || raw.includes('义乌') || lower.includes('update')) && (lower.includes('gc') || lower.includes('zc'))) {
     return 'CONTAINER_STATUS';
   }
 
-  // 3. 客户询价与库存确认 (quote, 现货, 多少钱, csk, sds, bolt, screw 等五金特征)
-  if (lower.includes('quote') || lower.includes('询价') || lower.includes('现货') || lower.includes('多少钱')) {
+  // 3. 客户询价 或 内部针对询价的跟进回复报价
+  const inquiryKeywords = ['quote', '询价', '现货', '多少钱', 'washer', 'csk', 'sds', 'bolt', 'screw', 'price'];
+  const hasInquiryWord = inquiryKeywords.some(k => lower.includes(k));
+  const isInternalReplyToQuote = quotedText && (lower.includes('@0.') || lower.includes('能等') || lower.includes('有货') || lower.includes('ctn') || lower.includes('pcs') || lower.includes('rm'));
+
+  if (hasInquiryWord || isInternalReplyToQuote) {
     return 'INQUIRY';
   }
 
-  // 4. 出货与来货通知 (DO单、车牌号、托盘、送货、到货、ZC/GC)
+  // 4. 出货/来货
   const logisticsKeywords = [
     'do', 'pallet', 'normal pallet', 'long pallet', 'lorry', 'plate',
     'zc', 'gc', '出货', '到货', 'incoming', '送货', 'batu caves', 'jawi profast'
@@ -107,7 +135,7 @@ function preClassifyMessage(text, quotedText, mentions) {
   return 'IGNORE';
 }
 
-// 防 429 频率限制调用机制
+// Gemini 调用防 429
 async function callGemini(prompt) {
   let delay = 3000;
   for (let i = 0; i < 2; i++) {
@@ -116,7 +144,7 @@ async function callGemini(prompt) {
       return res.response.text().trim();
     } catch (e) {
       if (String(e).includes('429') && i === 0) {
-        console.log(`[429 限频保护] 稍候 ${delay / 1000} 秒后自动重试...`);
+        console.log(`[429 限频保护] 等待 ${delay / 1000} 秒后重试...`);
         await new Promise(r => setTimeout(r, delay));
       } else {
         throw e;
@@ -125,7 +153,7 @@ async function callGemini(prompt) {
   }
 }
 
-// 启动 WhatsApp Gateway
+// 启动 WhatsApp 客户端
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
   const { version, isLatest } = await fetchLatestBaileysVersion();
@@ -168,7 +196,7 @@ async function startBot() {
   });
 }
 
-// 核心业务中枢路由
+// 主流程分发
 async function handleIncomingMessage(msg) {
   const chatId = msg.key.remoteJid;
   if (!chatId || chatId === 'status@broadcast') return;
@@ -180,12 +208,12 @@ async function handleIncomingMessage(msg) {
 
   if (!text) return;
 
-  // 1. 管理员指令交互 (回复任务编号如 "1" 或 "0" 取消)
+  // 1. 管理员指令审批
   const isFromAdmin = chatId === adminJid || (isFromMe && chatId.includes(ADMIN_NUMBER));
   if (isFromAdmin && /^\d+$/.test(text)) {
     const actionId = parseInt(text, 10);
     if (actionId === 0) {
-      await sock.sendMessage(chatId, { text: '❌ 已清空全部待办审批。' });
+      await sock.sendMessage(chatId, { text: '❌ 已清空待办审批。' });
       pendingTasks.clear();
       return;
     }
@@ -194,9 +222,9 @@ async function handleIncomingMessage(msg) {
       const targetJid = await resolveContactOrGroupJid(TARGET_NAME);
       if (targetJid) {
         await sock.sendMessage(targetJid, { text: task.finalText });
-        await sock.sendMessage(chatId, { text: `✅ [已转发] 任务 #${actionId} 已成功下发至 ${TARGET_NAME}！` });
+        await sock.sendMessage(chatId, { text: `✅ [已转发] #${actionId} 已下发至 ${TARGET_NAME}！` });
       } else {
-        await sock.sendMessage(chatId, { text: `⚠️ 未能匹配到目标【${TARGET_NAME}】，请确认通讯录已有聊天窗口。` });
+        await sock.sendMessage(chatId, { text: `⚠️ 未能匹配目标【${TARGET_NAME}】。` });
       }
       pendingTasks.delete(actionId);
       return;
@@ -207,56 +235,52 @@ async function handleIncomingMessage(msg) {
 
   appendChatHistory(chatId, pushName, text);
 
-  // 2. 调度场景研判
+  // 2. 场景分流
   const scene = preClassifyMessage(text, quotedText, mentions);
   if (scene === 'IGNORE' || !model) return;
 
+  const groupCompany = await resolveChatGroupName(chatId);
+
   // -------------------------------------------------------------
-  // 场景 1：【有任务@Profast Jiale】（本地直推，零 API 消耗）
+  // 场景 1：【有任务@Profast Jiale】
   // -------------------------------------------------------------
   if (scene === 'TASK_MENTION') {
+    const fromLabel = groupCompany ? `${pushName} (${groupCompany})` : pushName;
     const taskNotice = `🔔【有任务@Profast Jiale】
 ------------------------------------
-📌 派工来源: ${pushName}
+📌 派工来源: ${fromLabel}
 💬 任务指示:
 "${text}"
-${quotedText ? `\n📎 关联引用原单:\n"${quotedText}"` : ''}
+${quotedText ? `\n📎 关联引用:\n"${quotedText}"` : ''}
 ------------------------------------
-⏰ 请及时在工作群跟进！`;
+⏰ 请及时在群聊中跟进！`;
 
     await sock.sendMessage(adminJid, { text: taskNotice });
-    console.log(`[已推送艾特任务] 来源: ${pushName}`);
+    console.log(`[任务通知] 来源: ${fromLabel}`);
     return;
   }
 
   // -------------------------------------------------------------
-  // 场景 2：【货柜船期详情】（状态研判与盘托数学计算）
+  // 场景 2：【货柜船期详情】
   // -------------------------------------------------------------
   if (scene === 'CONTAINER_STATUS') {
     const containerPrompt = `
 你是一个专业的马来西亚五金紧固件海运进柜分析专家。
-请仔细解析以下【货柜船期更新清单】，并严格按照规则研判并统计盘托数量：
+解析以下货柜排期更新，严格按规则分类与统计盘托总数：
 
 【清单原文】:
 ${text}
 
-【研判与计算规则】：
-1. 状态分类：
-   - "未到" (未就绪/在途/卡关状态)：
-     包括但不限于："预计**到港"、"海关查验还未放行"、"询问运输几时派送中"、"预计**拉进运输仓库"、"ON SHIP"、"还未安排装柜"、"还未收到资料"。
-   - "将到" (已确认派送)：
-     明确注明 "运输安排**派送" (运输公司已定下派送日期准备送达)。
-2. 盘托数量计算：
-   - 提取每一行对应的托盘数（例如 "(4P)" -> 4，"3 NORMAL PALLET" -> 3，"2 LONG" -> 2）。
-   - 将所有属于 "未到" 状态的 Normal 与 Long 盘托数值进行整型累加，计算出 "未到盘托总数"。
-   - 将所有属于 "将到" 状态的 Normal 与 Long 盘托数值进行整型累加，计算出 "将到盘托总数"。
-3. 生成一份规整精简的各口岸（广州/义乌等）单号状态摘要。
+研判规则：
+1. "未到"：包含"预计**到港"、"海关查验还未放行"、"询问运输几时派送中"、"预计**拉进运输仓库"、"ON SHIP"、"还未安排装柜"、"还未收到资料"。
+2. "将到"：包含"运输安排**派送"。
+3. 盘托数量提取与整型求和：将 Normal 与 Long 盘托数值累加，分别计算"未到"和"将到"总数。
 
 仅输出严格 JSON 格式：
 {
   "undeliveredPallets": 0,
   "arrivingPallets": 0,
-  "summaryList": "简洁分行清单(港口/单号/状态)"
+  "summaryList": "简洁分行清单"
 }
 `;
 
@@ -267,7 +291,7 @@ ${text}
       const containerCard = `🚢【货柜船期详情】
 ------------------------------------
 📊【盘托统计】：
-⏳【未到货柜】: ${data.undeliveredPallets} 盘托 (船运中/海关查验/待拉仓)
+⏳【未到货柜】: ${data.undeliveredPallets} 盘托 (在船/海关查验/待拉仓)
 🚚【将到货柜】: ${data.arrivingPallets} 盘托 (已安排派送中)
 ------------------------------------
 📋【进柜状态概览】：
@@ -276,34 +300,42 @@ ${data.summaryList}
 💡 此简报仅供过目与备货仓位规划。`;
 
       await sock.sendMessage(adminJid, { text: containerCard });
-      console.log(`[已推送货柜船期] 未到: ${data.undeliveredPallets}, 将到: ${data.arrivingPallets}`);
     } catch (e) {
-      console.error('货柜船期详情解析异常:', e);
+      console.error('船期详情解析异常:', e);
     }
     return;
   }
 
   // -------------------------------------------------------------
-  // 场景 3：【询价/物】（客户询价，纯过目监控）
+  // 场景 3：【询价/物】双向闭环 + 超时报警系统
   // -------------------------------------------------------------
   if (scene === 'INQUIRY') {
     const inquiryPrompt = `
-你是一个专业的五金紧固件业务助理。分析以下群聊询价消息：
-最新消息: "${text}"
-引用内容: "${quotedText}"
-群聊上下文:
+你是一个专业的五金紧固件业务助理。
+请研判当前群聊消息是客户在询问紧固件价格/库存，还是内部同事正在进行回复/报价：
+
+【发件人】: ${pushName}
+【最新消息】: "${text}"
+【引用内容】: "${quotedText}"
+【群聊近期上下文】:
 ${getRecentContext(chatId)}
 
-请提炼：
-1. customer: 客户或咨询方名称
-2. items: 询问的具体产品、规格、牙型/头型、材质与数量 (例如 "SS304 CSK SDS #6x5/8 1 ctn", "Hex Bolt M10x1.5x30 11k")
-3. internalReply: 内部同事是否已有回应或提供报价 (若有简要概述，没有则填 "暂未回复")
+判断规则：
+1. 如果是内部同事正在回复/报价（提供单价、确认货期、询问能否等待等）：
+   - isReplyUpdate: true
+   - replyContent: 提取详细回复报价内容
+2. 如果是客户/采购在发起询价：
+   - isReplyUpdate: false
+   - replyContent: "暂未回复"
+3. 提取 customer: 询价发件人姓名
+4. 提取 items: 询价的具体产品规格、材质、头型/牙型及数量
 
-仅输出 JSON:
+仅输出严格 JSON 格式：
 {
+  "isReplyUpdate": true/false,
   "customer": "...",
   "items": "...",
-  "internalReply": "..."
+  "replyContent": "..."
 }
 `;
 
@@ -311,30 +343,83 @@ ${getRecentContext(chatId)}
       const rawRes = await callGemini(inquiryPrompt);
       const data = JSON.parse(rawRes.replace(/```json|```/g, '').trim());
 
-      const inquiryCard = `💬【询价/物】
-------------------------------------
-👤 咨询客户: ${data.customer || pushName}
-🔩 紧固件规格: ${data.items || '未注明'}
-📌 内部跟进: ${data.internalReply}
-------------------------------------
-👀 询价动态已过目，无需转发。`;
+      let customerDisplay = data.customer || pushName;
+      if (groupCompany && !customerDisplay.toUpperCase().includes(groupCompany.toUpperCase())) {
+        customerDisplay = `${customerDisplay} (${groupCompany})`;
+      }
 
-      await sock.sendMessage(adminJid, { text: inquiryCard });
-      console.log(`[已推送询价动态] 客户: ${data.customer}`);
+      if (data.isReplyUpdate) {
+        // --- 内部同事已回复：取消超时报警，推送完成闭环卡片 ---
+        if (activeInquiries.has(chatId)) {
+          clearTimeout(activeInquiries.get(chatId).timer);
+          activeInquiries.delete(chatId);
+          console.log(`[询价闭环] 群聊 ${chatId} 已有回复，清除报警定时器。`);
+        }
+
+        const replyCard = `💬【询价跟进 / 内部已回复】
+------------------------------------
+👤 咨询客户: ${customerDisplay}
+🔩 紧固件规格: ${data.items || '未注明'}
+📌 内部回复: ${data.replyContent} (由 ${pushName} 回复)
+------------------------------------
+✅ 报价闭环已完成，超时预警自动解除。`;
+
+        await sock.sendMessage(adminJid, { text: replyCard });
+      } else {
+        // --- 客户发起新询价：启动 15 分钟超时未回复倒计时 ---
+        if (activeInquiries.has(chatId)) {
+          clearTimeout(activeInquiries.get(chatId).timer);
+        }
+
+        const timeoutTimer = setTimeout(async () => {
+          const alertMsg = `⚠️【超时未回复预警 / Inquiry Alert】
+------------------------------------
+🏢 客户群组: ${groupCompany || '普通群聊'}
+👤 咨询客户: ${customerDisplay}
+🔩 紧固件规格: ${data.items || '未注明'}
+⏳ 等待时长: 已超过 15 分钟未响应！
+------------------------------------
+📢 办公室内台暂无人员跟进，请协调尽快报价！`;
+
+          try {
+            await sock.sendMessage(adminJid, { text: alertMsg });
+            console.log(`[超时警报] 群 ${chatId} 询价超过 15 分钟未回复！`);
+          } catch (err) {
+            console.error('发送超时预警失败:', err);
+          }
+          activeInquiries.delete(chatId);
+        }, INQUIRY_TIMEOUT_MS);
+
+        activeInquiries.set(chatId, {
+          customerDisplay,
+          items: data.items,
+          timer: timeoutTimer,
+          timestamp: Date.now()
+        });
+
+        const newInquiryCard = `💬【询价/物】
+------------------------------------
+👤 咨询客户: ${customerDisplay}
+🔩 紧固件规格: ${data.items || '未注明'}
+📌 内部回复: 暂未回复 (⏳ 15分钟应答倒计时中)
+------------------------------------
+👀 询价动态已过目，超时未回复将自动预警。`;
+
+        await sock.sendMessage(adminJid, { text: newInquiryCard });
+        console.log(`[新询价挂载] 客户: ${customerDisplay}，启动 15 分钟计时。`);
+      }
     } catch (e) {
-      console.error('询价解析异常:', e);
+      console.error('询价/报价双向闭环解析异常:', e);
     }
     return;
   }
 
   // -------------------------------------------------------------
-  // 场景 4：【出货/来货】（DO出货审批 或 进货到货入库）
+  // 场景 4：【出货/来货】
   // -------------------------------------------------------------
   if (scene === 'LOGISTICS') {
     const logisticsPrompt = `
-你是一个专业的五金紧固件仓储物流调度员。
-请结合以下消息、引用内容以及群聊历史进行深度研判：
-
+结合以下消息、引用内容及群聊历史进行研判：
 发件人: ${pushName}
 当前消息: "${text}"
 引用内容: "${quotedText}"
@@ -342,12 +427,11 @@ ${getRecentContext(chatId)}
 ${getRecentContext(chatId)}
 
 研判规则：
-1. 区分【出货】与【到货/来货】：
-   - 【来货/到货通知】：消息中没有送货客户名称与地点，核心为中国直发单号（如 ZC2600858, GC26005152）以及托盘详情（如 3 NORMAL PALLET, 4 LONG PALLET）。
-   - 【出货通知】：包含本地送货客户名称、区域（如 BATU CAVES）、DO单号、发货车牌号等。
-2. 遇到车牌补充：如果当前消息或上下文补充了马来西亚车牌（如 ANA9306），务必与引用的单据合并生成完整文案，车牌不要误判为单号。
+1. 【来货/到货通知】：无客户送货地址，主要包含中国直发单号（ZC/GC）与托盘规格（如 3 NORMAL PALLET, 4 LONG PALLET）。
+2. 【出货通知】：包含本地送货客户、送货区域、DO单号、车牌等。
+3. 补充车牌（如 ANA9306）需与引用的单据合并。
 
-仅输出 JSON:
+仅输出严格 JSON 格式:
 {
   "isLogistics": true/false,
   "type": "出货" 或 "来货",
@@ -355,7 +439,7 @@ ${getRecentContext(chatId)}
   "time": "...",
   "doOrChinaNo": "DO单号或中国单号(ZC/GC)",
   "lorryPlate": "车牌号(如适用)",
-  "pallets": "托盘/件数规格",
+  "pallets": "托盘/规格",
   "area": "送货区域(出货适用)",
   "customer": "客户名称(出货适用)",
   "phone": "联系电话"
@@ -396,7 +480,7 @@ ${getRecentContext(chatId)}
 
         const approvalCard = `📋【待审批 - 出货/来货 #${taskId}】
 类型: ${data.type}通知
-来源: ${pushName}
+来源: ${groupCompany ? `${pushName} (${groupCompany})` : pushName}
 目标: ${TARGET_NAME}
 
 预定发送文案:
@@ -407,15 +491,15 @@ ${output}
 👉 回复【0】丢弃全部待办`;
 
         await sock.sendMessage(adminJid, { text: approvalCard });
-        console.log(`[已推送审批 - 出货/来货] #${taskId} (${data.type})`);
+        console.log(`[审批卡片] #${taskId} (${data.type})`);
       }
     } catch (e) {
-      console.error('物流出货/来货解析异常:', e);
+      console.error('出货/来货解析异常:', e);
     }
   }
 }
 
-// 目标联系人/群聊解析
+// 目标联系人/群解析
 async function resolveContactOrGroupJid(name) {
   try {
     const chats = await sock.groupFetchAllParticipating();
@@ -455,6 +539,7 @@ app.get('/qr', (req, res) => {
   }
 });
 
+app.get('/status', (req, res) => res.json({ status: 'ok', live: true }));
 app.get('/', (req, res) => res.send('Fastener Supply Chain AI Dispatch Center Live.'));
 
 app.listen(PORT, () => {
